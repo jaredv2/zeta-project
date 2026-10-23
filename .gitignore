@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+!.env.docker.example
+bot/.env
+bot/.env.*
+!.env.example
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+bng_content/
