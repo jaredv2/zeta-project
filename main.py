@@ -66,6 +66,7 @@ class Config:
 
 
 MAX_PATH_LEN = 1024
+HEALTH_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 
 
 # --------------------------------------------------------------------------
@@ -122,7 +123,7 @@ app = FastAPI(title="ZETA file proxy", lifespan=lifespan, docs_url=None, redoc_u
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()],
-    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
+    allow_methods=list(HEALTH_METHODS),
     allow_headers=["*"],
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"],
 )
@@ -254,7 +255,13 @@ async def files_with_path_key(key: str, path: str, request: Request) -> Response
     return await serve(request, key, path)
 
 
-@app.get("/healthz", include_in_schema=False)
+@app.api_route(
+    "/healthz",
+    methods=list(HEALTH_METHODS),
+    include_in_schema=False,
+)
 async def healthz(request: Request) -> PlainTextResponse:
     await request.app.state.store.ping()
+    if request.method == "HEAD":
+        return PlainTextResponse("", headers={"Content-Length": "2"})
     return PlainTextResponse("ok")

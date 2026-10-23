@@ -4,7 +4,8 @@ The root [Dockerfile](../Dockerfile) installs both dependency sets and starts
 the FastAPI service and Discord bot together in one container. The
 [supervisor](../run_services.py) binds the API to Render's `PORT`; if either
 process exits, it stops the other and exits so Render can restart the service.
-The API health check is `GET /healthz`.
+the API health check is `/healthz`, available with `GET`, `HEAD`, `POST`, `PUT`,
+`PATCH`, `DELETE`, and `OPTIONS`.
 
 Run **one instance only**. Scaling to multiple instances would run multiple
 Discord bot connections and duplicate bot activity. Use an always-on paid

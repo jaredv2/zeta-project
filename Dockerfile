@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt bot/requirements.txt ./
+COPY requirements.txt ./requirements.txt
+COPY bot/requirements.txt ./bot/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt -r bot/requirements.txt
 
 COPY checks.py config.py cosmetics.py db.py keygen.py main.py run_services.py ./
