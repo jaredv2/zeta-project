@@ -52,18 +52,23 @@ def scope_allows(scope: str, path: str) -> bool:
     parts = path.split("/")
     if parts[0] == "cosmetics":
         grants = SCOPE_COSMETICS.get(scope)
-        if grants is None or len(parts) != 4:
+        if grants is None or len(parts) < 3:
             return False
         category, cosmetic = parts[1], parts[2]
         if category == "pickaxes":
-            return (
+            return len(parts) == 4 and (
                 cosmetic in grants["pickaxes"]
                 and parts[3] == "6e813a3edd180fe07ca4e438849b67b5.bundle"
             )
         if category == "wood":
+            if cosmetic not in grants["wood"]:
+                return False
+            if len(parts) == 4:
+                return parts[3] == "cdbbb83c0ef9757d51e8dedb4979dcc3.data"
             return (
-                cosmetic in grants["wood"]
-                and parts[3] == "cdbbb83c0ef9757d51e8dedb4979dcc3.data"
+                len(parts) == 5
+                and parts[3] == "default-background"
+                and parts[4] == "cdbbb83c0ef9757d51e8dedb4979dcc3.data"
             )
         return False
     prefixes = SCOPE_PREFIXES[scope]

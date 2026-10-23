@@ -16,7 +16,8 @@ token in the Developer Portal before deployment; never commit local env files.
 
 The current private-bucket package is staged under
 [`bng_content/release/`](./bng_content/release/). It contains two scope-specific
-pickaxe bundles and five lobby-background wood data files. See
+pickaxe bundles and two background-mode data files for each of five wood looks.
+See
 [`bng_content/docs/LOCAL_SERVING.md`](./bng_content/docs/LOCAL_SERVING.md) for
 staging, Supabase upload, Render configuration, and userscript setup.
 

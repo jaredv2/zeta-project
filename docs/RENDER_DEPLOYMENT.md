@@ -89,9 +89,10 @@ Wait for Render's deploy and health check to pass, then verify:
 The health endpoint pings Postgres. A healthy HTTP process is not enough if
 the bot failed to connect, so verify both service logs and bot status.
 
-Once the service is healthy, set its HTTPS URL in the userscript's **Set Zeta
-API URL** menu item. Never put `SUPABASE_SERVICE_KEY` or `DISCORD_TOKEN` in the
-userscript.
+The userscript is configured to use `https://zeta-project.onrender.com` by
+default. Its **Set Zeta API URL** menu item can override this for local testing
+or if the deployment URL changes. Never put `SUPABASE_SERVICE_KEY` or
+`DISCORD_TOKEN` in the userscript.
 
 ## Local Docker Compose
 
