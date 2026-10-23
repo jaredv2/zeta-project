@@ -21,7 +21,7 @@ log = logging.getLogger("zeta")
 
 BASE_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = BASE_DIR / "schema.sql"
-EXTENSIONS = ("cogs.verify", "cogs.keys_user", "cogs.keys_admin")
+EXTENSIONS = ("cogs.verify", "cogs.keys_user", "cogs.keys_admin", "cogs.votes")
 
 
 class ZetaTree(app_commands.CommandTree):
@@ -69,6 +69,7 @@ class ZetaBot(commands.Bot):
             self.settings.database_url,
             ssl_mode=self.settings.db_ssl,
             max_size=self.settings.db_pool_max,
+            key_pepper=self.settings.key_pepper,
         )
         if self.settings.auto_migrate:
             await self.store.ensure_schema(SCHEMA_PATH)
@@ -96,6 +97,12 @@ class ZetaBot(commands.Bot):
 
     async def on_ready(self) -> None:
         assert self.user is not None
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="custom pickaxes with zeta",
+            )
+        )
         dprint(f"logged in as {self.user} (id={self.user.id}) in {len(self.guilds)} guild(s)")
         log.info("Ready as %s", self.user)
 

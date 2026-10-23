@@ -32,6 +32,8 @@ from unittest.mock import AsyncMock, MagicMock
 os.environ.setdefault("DEBUG_PRINTS", "false")
 
 ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = ROOT.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(ROOT))
 
 import asyncpg  # noqa: E402
@@ -42,11 +44,13 @@ from checks import NotAuthorized  # noqa: E402
 from cogs.keys_admin import KeysAdmin  # noqa: E402
 from cogs.keys_user import KeysUser  # noqa: E402
 from cogs.verify import Verify, VerifyView  # noqa: E402
+from cogs.votes import DURATIONS, VOTE_EMOJI, vote_count  # noqa: E402
 from config import Settings  # noqa: E402
 from db import (  # noqa: E402
     ActiveKeyExists, CooldownActive, InvalidScope, KeyNotFound, KeyStateError, KeyStore, NoActiveKey,
+    SubmissionLimitReached, VoteAlreadyActive,
 )
-from keygen import DEFAULT_SCOPE, SCOPES, is_valid_key, mask_key  # noqa: E402
+from keygen import DEFAULT_SCOPE, SCOPES, is_valid_key, key_verifier, mask_key  # noqa: E402
 from main import EXTENSIONS, SCHEMA_PATH, ZetaBot  # noqa: E402
 
 BASE = 900_000_000_000_000_000
@@ -162,16 +166,35 @@ async def test_store(store: KeyStore, dsn: str, ssl: str) -> None:
     row, created = await store.get_or_issue(owner_id=ALICE, guild_id=GUILD)
     alice_key_1 = row["key"]
     check("get_or_issue creates a key", created)
-    check("key matches ZETA-XXXX-XXXX-XXXX-ATEZ", is_valid_key(alice_key_1), alice_key_1)
+    check("key matches current ZETA format", is_valid_key(alice_key_1), mask_key(alice_key_1))
+    check(
+        "database stores only a keyed verifier, not the raw key",
+        row["key_hash"] == key_verifier(alice_key_1, store._key_pepper)
+        and row["key"] == alice_key_1,
+    )
+    async with store._pool.acquire() as conn:
+        has_plaintext_key_column = await conn.fetchval(
+            """
+            select exists (
+                select 1 from information_schema.columns
+                where table_schema='public' and table_name='zeta_keys' and column_name='key'
+            )
+            """
+        )
+    check("legacy plaintext database column was removed", not has_plaintext_key_column)
     check("default scope is 'default'", row["scope"] == DEFAULT_SCOPE == "default")
     check("new key is active", row["status"] == "active")
 
     row_again, created_again = await store.get_or_issue(owner_id=ALICE, guild_id=GUILD)
-    check("second get_or_issue returns the SAME key", row_again["key"] == alice_key_1 and not created_again)
+    check(
+        "second get_or_issue returns the same verifier without revealing the key",
+        row_again["key_hash"] == row["key_hash"] and "key" not in row_again.keys() and not created_again,
+    )
 
     results = await asyncio.gather(*[store.get_or_issue(owner_id=BOB, guild_id=GUILD) for _ in range(12)])
-    check("12 parallel /get-key calls give exactly one key", len({r[0]["key"] for r in results}) == 1)
+    check("12 parallel /get-key calls share one verifier", len({r[0]["key_hash"] for r in results}) == 1)
     check("...and exactly one of them created it", sum(1 for r in results if r[1]) == 1)
+    check("only the creator receives the raw key", sum(1 for r, created in results if created and "key" in r) == 1)
     async with store._pool.acquire() as conn:
         active_bob = await conn.fetchval(
             "select count(*) from public.zeta_keys where owner_id=$1 and status='active'", BOB)
@@ -179,7 +202,11 @@ async def test_store(store: KeyStore, dsn: str, ssl: str) -> None:
 
     exc = await raises(ActiveKeyExists, store.issue_key(
         owner_id=ALICE, guild_id=GUILD, actor_id=ADMIN, scope="all"))
-    check("issue_key refuses a second active key", exc is not None and exc.existing["key"] == alice_key_1)
+    check(
+        "issue_key refuses a second active key without returning its secret",
+        exc is not None and exc.existing["key_hint"] == row["key_hint"]
+        and "key" not in exc.existing.keys(),
+    )
 
     exc = await raises(InvalidScope, store.issue_key(
         owner_id=CAROL, guild_id=GUILD, actor_id=ADMIN, scope="vip"))
@@ -231,11 +258,12 @@ async def test_store(store: KeyStore, dsn: str, ssl: str) -> None:
     check("audit trail records issue/revoke/restore", {"issued", "revoked", "restored"} <= set(actions), str(actions))
 
     async with store._pool.acquire() as conn:
-        bad_key = await raises(asyncpg.CheckViolationError, conn.execute(
-            "insert into public.zeta_keys (key, owner_id) values ('NOPE', $1)", EVE))
+        missing_verifier = await raises(asyncpg.NotNullViolationError, conn.execute(
+            "insert into public.zeta_keys (key_hash, key_hint, owner_id) values (null, '****', $1)", EVE))
         bad_scope = await raises(asyncpg.CheckViolationError, conn.execute(
-            "insert into public.zeta_keys (key, owner_id, scope) values ('ZETA-AAAA-BBBB-CCCC-ATEZ', $1, 'vip')", EVE))
-    check("database rejects malformed keys", bad_key is not None)
+            "insert into public.zeta_keys (key_hash, key_hint, owner_id, scope) "
+            "values ('not-a-real-hash', '****', $1, 'unknown')", EVE))
+    check("database rejects missing key verifiers", missing_verifier is not None)
     check("database rejects unknown scopes", bad_scope is not None)
 
     # pagination data: 12 sweat keys
@@ -252,6 +280,67 @@ async def test_store(store: KeyStore, dsn: str, ssl: str) -> None:
     check("stats counts by scope/status", stats["counts"].get(("sweat", "active"), 0) >= 13 and stats["owners"] >= 15)
     check("get_latest_key prefers the active key", (await store.get_latest_key(CAROL))["id"] == k1["id"])
 
+    # Durable lobby vote workflow --------------------------------------
+    review_config = await store.set_vote_review_channel(GUILD, VCHANNEL)
+    check("review channel is saved per guild", review_config["review_channel_id"] == VCHANNEL)
+    vote = await store.open_vote(
+        guild_id=GUILD, channel_id=VCHANNEL, actor_id=ADMIN, duration=dt.timedelta(hours=1)
+    )
+    check("vote opens with its deadline and target channel",
+          vote["status"] == "open" and vote["submission_channel_id"] == VCHANNEL)
+    exc = await raises(VoteAlreadyActive, store.open_vote(
+        guild_id=GUILD, channel_id=VCHANNEL, actor_id=ADMIN, duration=dt.timedelta(hours=1)))
+    check("a guild cannot open a second vote while one is active", exc is not None)
+
+    alice_submission = await store.reserve_vote_submission(
+        guild_id=GUILD, submitter_id=ALICE, submission_limit=1
+    )
+    exc = await raises(SubmissionLimitReached, store.reserve_vote_submission(
+        guild_id=GUILD, submitter_id=ALICE, submission_limit=1))
+    check("one-submission limit is enforced for the active vote", exc is not None)
+    bob_first = await store.reserve_vote_submission(
+        guild_id=GUILD, submitter_id=BOB, submission_limit=2
+    )
+    bob_second = await store.reserve_vote_submission(
+        guild_id=GUILD, submitter_id=BOB, submission_limit=2
+    )
+    exc = await raises(SubmissionLimitReached, store.reserve_vote_submission(
+        guild_id=GUILD, submitter_id=BOB, submission_limit=2))
+    check("two-submission role limit is enforced for the active vote", exc is not None)
+
+    submissions = [
+        (alice_submission, BASE + 2001),
+        (bob_first, BASE + 2002),
+        (bob_second, BASE + 2003),
+    ]
+    for submission, message_id in submissions:
+        await store.publish_vote_submission(
+            submission["id"], message_id=message_id,
+            image_url=f"https://cdn.example/{message_id}.png", file_name="background.png",
+        )
+    await store.finish_vote_tally(
+        vote["id"],
+        {alice_submission["id"]: 4, bob_first["id"]: 4, bob_second["id"]: 2},
+    )
+    first_review = await store.claim_next_vote_review(vote["id"])
+    check("review queue starts with the earliest highest-voted entry",
+          first_review is not None and first_review["id"] == alice_submission["id"]
+          and first_review["vote_count"] == 4)
+    denied = await store.resolve_vote_submission(
+        first_review["id"], approved=False, actor_id=ADMIN
+    )
+    next_review = await store.claim_next_vote_review(vote["id"])
+    check("denying an entry advances through tied entries in creation order",
+          denied is not None and next_review is not None and next_review["id"] == bob_first["id"]
+          and next_review["vote_count"] == 4)
+    selected = await store.resolve_vote_submission(
+        next_review["id"], approved=True, actor_id=ADMIN
+    )
+    check("approving an entry selects it and ends the vote",
+          selected is not None and selected["review_status"] == "selected"
+          and selected["vote_status"] == "selected"
+          and await store.get_active_vote(GUILD) is None)
+
 
 # ----------------------------------------------------------------------
 # 2. Command definitions
@@ -261,16 +350,33 @@ async def test_definitions(settings: Settings) -> ZetaBot:
     bot = ZetaBot(settings)
     for ext in EXTENSIONS:
         await bot.load_extension(ext)
-    check("all three extensions load", len(bot.extensions) == 3)
+    check("all four extensions load", len(bot.extensions) == 4)
 
     top = {c.name: c for c in bot.tree.get_commands()}
-    expected_top = {"get-key", "key-info", "key-history", "regen-key", "verify-setup", "verify-config", "keyadmin"}
+    expected_top = {
+        "get-key", "key-info", "key-history", "regen-key", "verify-setup", "verify-config",
+        "keyadmin", "set-review-channel", "open-votes", "add-sub",
+    }
     check("top-level commands are registered", expected_top <= set(top), str(sorted(top)))
     subs = {c.name for c in top["keyadmin"].commands}
     check("keyadmin subcommands", {"create", "lookup", "scope", "revoke", "restore", "list", "stats"} <= subs, str(subs))
 
     payloads = [c.to_dict(bot.tree) for c in bot.tree.get_commands()]
     check("every command serialises to a Discord payload", len(payloads) == len(top))
+    open_vote_options = next(p for p in payloads if p["name"] == "open-votes")["options"]
+    duration_choices = next(o for o in open_vote_options if o["name"] == "max_time")["choices"]
+    check(
+        "vote duration choices match the supported durations",
+        {choice["value"] for choice in duration_choices} == set(DURATIONS),
+    )
+    check("vote reactions use a single configured marker", VOTE_EMOJI == "✅")
+    reaction_message = SimpleNamespace(
+        reactions=[
+            SimpleNamespace(emoji="✅", count=4, me=True),
+            SimpleNamespace(emoji="👀", count=8, me=False),
+        ]
+    )
+    check("vote tally excludes the bot's seeded reaction", vote_count(reaction_message) == 3)
 
     def walk(options, trail):
         for opt in options or []:
@@ -400,15 +506,19 @@ async def test_commands(store: KeyStore, settings: Settings) -> None:
 
     inter = make_interaction(fake_bot, member)
     await user_cog.get_key.callback(user_cog, inter)
-    check("/get-key is stable (same key on repeat)", key_in(last_embed(inter)) == dave_key and "new" not in last_embed(inter).title.lower())
+    check(
+        "/get-key repeat does not reveal the stored key",
+        key_in(last_embed(inter)) == mask_key(dave_key)
+        and "new" not in last_embed(inter).title.lower(),
+    )
 
     inter = make_interaction(fake_bot, member)
     await user_cog.key_info.callback(user_cog, inter)
-    check("/key-info shows the key", key_in(last_embed(inter)) == dave_key)
+    check("/key-info shows only the key hint", key_in(last_embed(inter)) == mask_key(dave_key))
 
     inter = make_interaction(fake_bot, member)
     await user_cog.key_history.callback(user_cog, inter)
-    check("/key-history lists the key", dave_key in last_embed(inter).description)
+    check("/key-history lists only the key hint", mask_key(dave_key) in last_embed(inter).description)
 
     # regen: cancel, success, cooldown
     async def run_regen(button: str):
@@ -426,7 +536,8 @@ async def test_commands(store: KeyStore, settings: Settings) -> None:
         return inter
 
     inter = await run_regen("cancel")
-    check("/regen-key cancel keeps the key", (await store.get_active_key(DAVE))["key"] == dave_key
+    check("/regen-key cancel keeps the key",
+          (await store.get_active_key(DAVE))["key_hash"] == key_verifier(dave_key, store._key_pepper)
           and "Cancelled" in inter.edit_original_response.call_args.kwargs["content"])
 
     fake_bot.settings = dataclasses.replace(settings, regen_cooldown_hours=0.0)
@@ -477,47 +588,37 @@ async def test_commands(store: KeyStore, settings: Settings) -> None:
           and (await store.get_key(created_key))["status"] == "revoked")
 
     inter = make_interaction(fake_bot, admin)
-    await admin_cog.lookup.callback(admin_cog, inter, target, None)
+    await admin_cog.lookup.callback(admin_cog, inter, target)
     embed = last_embed(inter)
-    check("/keyadmin lookup by user shows key + activity",
-          key_in(embed) == replaced_key and any(f.name == "Recent activity" for f in embed.fields))
-    inter = make_interaction(fake_bot, admin)
-    await admin_cog.lookup.callback(admin_cog, inter, None, f"`{replaced_key.lower()}`")
-    check("/keyadmin lookup by key tolerates case and backticks", key_in(last_embed(inter)) == replaced_key)
-    inter = make_interaction(fake_bot, admin)
-    await admin_cog.lookup.callback(admin_cog, inter, None, "not-a-key")
-    check("/keyadmin lookup rejects malformed keys", last_embed(inter).title == "Invalid key")
-    inter = make_interaction(fake_bot, admin)
-    await admin_cog.lookup.callback(admin_cog, inter, target, replaced_key)
-    check("/keyadmin lookup rejects user+key together", last_embed(inter).title == "Pick one")
-    inter = make_interaction(fake_bot, admin)
-    await admin_cog.lookup.callback(admin_cog, inter, None, "ZETA-AAAA-AAAA-AAAA-ATEZ")
-    check("/keyadmin lookup reports unknown keys", last_embed(inter).title == "Not found")
+    check("/keyadmin lookup by user shows key hint + activity",
+          key_in(embed) == mask_key(replaced_key) and any(f.name == "Recent activity" for f in embed.fields))
+    lookup_options = [option.name for option in admin_cog.lookup.parameters]
+    check("/keyadmin lookup never accepts a raw key", "key" not in lookup_options)
 
     target.send.reset_mock()
     inter = make_interaction(fake_bot, admin)
     builds = app_commands.Choice(name="builds", value="builds")
-    await admin_cog.scope.callback(admin_cog, inter, builds, target, None, True)
+    await admin_cog.scope.callback(admin_cog, inter, builds, target, True)
     check("/keyadmin scope updates the scope", (await store.get_key(replaced_key))["scope"] == "builds")
     check("/keyadmin scope DMs the member", target.send.await_count == 1)
     inter = make_interaction(fake_bot, admin)
-    await admin_cog.scope.callback(admin_cog, inter, builds, target, None, False)
+    await admin_cog.scope.callback(admin_cog, inter, builds, target, False)
     check("/keyadmin scope says 'No change' for same scope", last_embed(inter).title == "No change")
 
     inter = make_interaction(fake_bot, admin)
-    await admin_cog.revoke.callback(admin_cog, inter, target, None, "chargeback", True)
+    await admin_cog.revoke.callback(admin_cog, inter, target, "chargeback", True)
     check("/keyadmin revoke by user revokes the key", (await store.get_key(replaced_key))["status"] == "revoked")
     check("/keyadmin revoke records the reason", (await store.get_key(replaced_key))["revoke_reason"] == "chargeback")
     check("/keyadmin revoke masks the key in its reply", replaced_key not in (last_embed(inter).description or ""))
     inter = make_interaction(fake_bot, admin)
-    await admin_cog.revoke.callback(admin_cog, inter, None, replaced_key, None, False)
+    await admin_cog.revoke.callback(admin_cog, inter, target, None, False)
     check("/keyadmin revoke twice says nothing to do", last_embed(inter).title == "Nothing to do")
     inter = make_interaction(fake_bot, admin)
-    await admin_cog.revoke.callback(admin_cog, inter, make_member(BASE + 77), None, None, False)
+    await admin_cog.revoke.callback(admin_cog, inter, make_member(BASE + 77), None, False)
     check("/keyadmin revoke for a keyless user says not found", last_embed(inter).title == "Not found")
 
     inter = make_interaction(fake_bot, admin)
-    await admin_cog.restore.callback(admin_cog, inter, None, replaced_key)
+    await admin_cog.restore.callback(admin_cog, inter, target)
     check("/keyadmin restore re-activates the key", (await store.get_key(replaced_key))["status"] == "active")
 
     inter = make_interaction(fake_bot, admin)
@@ -550,6 +651,12 @@ async def test_commands(store: KeyStore, settings: Settings) -> None:
 # ----------------------------------------------------------------------
 async def cleanup(store: KeyStore) -> None:
     async with store._pool.acquire() as conn:
+        await conn.execute(
+            "delete from public.zeta_votes where guild_id between $1 and $2", BASE, BASE + 9999
+        )
+        await conn.execute(
+            "delete from public.zeta_vote_config where guild_id between $1 and $2", BASE, BASE + 9999
+        )
         await conn.execute("delete from public.zeta_keys where owner_id between $1 and $2", BASE, BASE + 9999)
         await conn.execute("delete from public.zeta_guild_config where guild_id between $1 and $2", BASE, BASE + 9999)
     print("\n[cleanup] test rows removed")
@@ -562,11 +669,12 @@ async def main() -> int:
         return 2
     ssl = os.getenv("TEST_DB_SSL", "require")
     settings = Settings(
-        token="test", database_url=dsn, db_ssl=ssl, db_pool_max=5, dev_guild_id=None, auto_migrate=True,
+        token="test", database_url=dsn, key_pepper=os.getenv("ZETA_KEY_PEPPER", "test-pepper-" + "x" * 32),
+        db_ssl=ssl, db_pool_max=5, dev_guild_id=None, auto_migrate=True,
         sync_commands=False, require_verified=True, regen_cooldown_hours=24.0,
         admin_role_ids=frozenset(), log_level="INFO",
     )
-    store = await KeyStore.connect(dsn, ssl_mode=ssl, max_size=5)
+    store = await KeyStore.connect(dsn, ssl_mode=ssl, max_size=5, key_pepper=settings.key_pepper)
     try:
         await store.ensure_schema(SCHEMA_PATH)
         await cleanup(store)  # start from a clean slate in case a previous run crashed

@@ -18,7 +18,15 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import asyncpg
 
 from config import dprint, redact_dsn
-from keygen import DEFAULT_SCOPE, SCOPES, generate_key, mask_key
+from keygen import (
+    DEFAULT_SCOPE,
+    SCOPES,
+    configured_key_pepper,
+    generate_key,
+    key_verifier,
+    mask_key,
+    normalize_key,
+)
 
 log = logging.getLogger("zeta.db")
 
@@ -66,6 +74,22 @@ class CooldownActive(StoreError):
         self.retry_after = retry_after
 
 
+class VoteUnavailable(StoreError):
+    pass
+
+
+class VoteAlreadyActive(StoreError):
+    pass
+
+
+class SubmissionLimitReached(StoreError):
+    pass
+
+
+class VoteSubmissionsPending(StoreError):
+    pass
+
+
 def _check_scope(scope: str) -> str:
     if scope not in SCOPES:
         raise InvalidScope(f"Unknown scope {scope!r}. Valid scopes: {', '.join(SCOPES)}")
@@ -88,16 +112,21 @@ def clean_dsn(dsn: str) -> str:
 class KeyStore:
     """All SQL lives here; cogs never touch the pool directly."""
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, key_pepper: str) -> None:
         self._pool = pool
+        self._key_pepper = key_pepper
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
     @classmethod
     async def connect(
-        cls, dsn: str, *, ssl_mode: str = "require", min_size: int = 1, max_size: int = 5
+        cls, dsn: str, *, ssl_mode: str = "require", min_size: int = 1, max_size: int = 5,
+        key_pepper: Optional[str] = None,
     ) -> "KeyStore":
+        pepper = key_pepper if key_pepper is not None else configured_key_pepper()
+        if len(pepper.encode("utf-8")) < 32:
+            raise ValueError("ZETA_KEY_PEPPER must contain at least 32 bytes.")
         dsn = clean_dsn(dsn)
         kwargs: dict[str, Any] = {
             "dsn": dsn,
@@ -122,7 +151,7 @@ class KeyStore:
                 exc,
             )
             raise
-        store = cls(pool)
+        store = cls(pool, pepper)
         await store.ping()
         dprint("database connection OK")
         return store
@@ -134,10 +163,48 @@ class KeyStore:
             raise RuntimeError("database ping returned an unexpected value")
 
     async def ensure_schema(self, schema_path: Path) -> None:
-        """Run schema.sql (idempotent). Plain execute() allows several statements at once."""
+        """Apply schema and upgrade legacy plaintext keys to HMAC-only storage."""
         sql = schema_path.read_text(encoding="utf-8")
         async with self._pool.acquire() as conn:
-            await conn.execute(sql)
+            async with conn.transaction():
+                await conn.execute("select pg_advisory_xact_lock(781204293612345)")
+                await conn.execute(sql)
+                legacy_column = await conn.fetchval(
+                    """
+                    select exists (
+                        select 1 from information_schema.columns
+                        where table_schema = 'public' and table_name = 'zeta_keys'
+                          and column_name = 'key'
+                    )
+                    """
+                )
+                if legacy_column:
+                    legacy_rows = await conn.fetch(
+                        "select id, key, key_hash, key_hint from public.zeta_keys"
+                    )
+                    for row in legacy_rows:
+                        raw_key = row["key"]
+                        normalized_key = normalize_key(raw_key)
+                        verifier = row["key_hash"] or key_verifier(normalized_key, self._key_pepper)
+                        hint = row["key_hint"] or mask_key(normalized_key)
+                        await conn.execute(
+                            "update public.zeta_keys set key_hash = $2, key_hint = $3 where id = $1",
+                            row["id"], verifier, hint,
+                        )
+                    await conn.execute("alter table public.zeta_keys drop column key")
+
+                await conn.execute(
+                    "alter table public.zeta_keys alter column key_hash set not null"
+                )
+                await conn.execute(
+                    "alter table public.zeta_keys alter column key_hint set not null"
+                )
+                await conn.execute(
+                    """
+                    create unique index if not exists zeta_keys_key_hash_unique
+                    on public.zeta_keys (key_hash)
+                    """
+                )
         dprint(f"schema applied from {schema_path.name}")
 
     async def close(self) -> None:
@@ -169,8 +236,8 @@ class KeyStore:
         )
         dprint(f"event key_id={key_id} action={action} actor={actor_id} details={details}")
 
-    @staticmethod
     async def _insert_key(
+        self,
         conn: asyncpg.Connection,
         *,
         owner_id: int,
@@ -178,22 +245,25 @@ class KeyStore:
         scope: str,
         created_by: Optional[int],
         note: Optional[str],
-    ) -> Record:
-        """Insert a brand-new random key. ON CONFLICT DO NOTHING means a (1 in 10^18)
+    ) -> dict[str, Any]:
+        """Insert a brand-new random key. ON CONFLICT DO NOTHING handles collisions.
         collision just returns no row and we try again, instead of raising."""
         for attempt in range(1, 6):
             key = generate_key()
+            verifier = key_verifier(key, self._key_pepper)
+            hint = mask_key(key)
             row = await conn.fetchrow(
                 """
-                insert into public.zeta_keys (key, owner_id, guild_id, scope, created_by, note)
-                values ($1, $2, $3, $4, $5, $6)
-                on conflict (key) do nothing
+                insert into public.zeta_keys
+                    (key_hash, key_hint, owner_id, guild_id, scope, created_by, note)
+                values ($1, $2, $3, $4, $5, $6, $7)
+                on conflict (key_hash) do nothing
                 returning *
                 """,
-                key, owner_id, guild_id, scope, created_by, note,
+                verifier, hint, owner_id, guild_id, scope, created_by, note,
             )
             if row is not None:
-                return row
+                return {**dict(row), "key": key}
             dprint(f"key collision on attempt {attempt}, retrying")
         raise StoreError("Could not generate a unique key, please try again.")
 
@@ -232,7 +302,10 @@ class KeyStore:
     # ------------------------------------------------------------------
     async def get_key(self, key: str) -> Optional[Record]:
         async with self._pool.acquire() as conn:
-            return await conn.fetchrow("select * from public.zeta_keys where key = $1", key)
+            return await conn.fetchrow(
+                "select * from public.zeta_keys where key_hash = $1",
+                key_verifier(normalize_key(key), self._key_pepper),
+            )
 
     async def get_active_key(self, owner_id: int) -> Optional[Record]:
         async with self._pool.acquire() as conn:
@@ -336,7 +409,7 @@ class KeyStore:
         note: Optional[str] = None,
         replace: bool = False,
         action: str = "issued",
-    ) -> Record:
+    ) -> dict[str, Any]:
         """Create a key. With replace=True any current active key is revoked first (same transaction)."""
         scope = _check_scope(scope)
         try:
@@ -359,7 +432,7 @@ class KeyStore:
                     created_by=actor_id, note=note,
                 )
                 await self._log_event(conn, row["id"], action, actor_id, {"scope": scope})
-                dprint(f"issued {mask_key(row['key'])} to owner={owner_id} scope={scope}")
+                dprint(f"issued {row['key_hint']} to owner={owner_id} scope={scope}")
                 return row
         except asyncpg.UniqueViolationError as exc:
             # Only the one-active-key index can fire here (key collisions are handled by ON CONFLICT).
@@ -367,7 +440,9 @@ class KeyStore:
                 raise ActiveKeyExists(await self.get_active_key(owner_id)) from exc
             raise
 
-    async def get_or_issue(self, *, owner_id: int, guild_id: Optional[int]) -> tuple[Record, bool]:
+    async def get_or_issue(
+        self, *, owner_id: int, guild_id: Optional[int]
+    ) -> tuple[Record | dict[str, Any], bool]:
         """Self-service /get-key: return (key_row, created). Safe against double clicks."""
         existing = await self.get_active_key(owner_id)
         if existing is not None:
@@ -386,7 +461,7 @@ class KeyStore:
 
     async def regenerate_key(
         self, *, owner_id: int, guild_id: Optional[int], cooldown: dt.timedelta
-    ) -> Record:
+    ) -> dict[str, Any]:
         """Owner-initiated rotation. Keeps the scope, revokes the old key, enforces the cooldown."""
         async with self._pool.acquire() as conn, conn.transaction():
             current = await conn.fetchrow(
@@ -418,7 +493,7 @@ class KeyStore:
             )
             await self._log_event(conn, row["id"], "regenerated", owner_id,
                                   {"scope": row["scope"], "previous_key_id": current["id"]})
-            dprint(f"regenerated {mask_key(current['key'])} -> {mask_key(row['key'])}")
+            dprint(f"regenerated {current['key_hint']} -> {row['key_hint']}")
             return row
 
     async def set_scope(self, key_id: int, scope: str, *, actor_id: int) -> tuple[Record, str]:
@@ -437,7 +512,7 @@ class KeyStore:
                 "update public.zeta_keys set scope = $2 where id = $1 returning *", key_id, scope
             )
             await self._log_event(conn, key_id, "scope_changed", actor_id, {"from": old, "to": scope})
-            dprint(f"scope {old} -> {scope} for {mask_key(row['key'])}")
+            dprint(f"scope {old} -> {scope} for {row['key_hint']}")
             return row, old
 
     async def revoke_key(self, key_id: int, *, actor_id: int, reason: Optional[str] = None) -> Record:
@@ -457,7 +532,7 @@ class KeyStore:
                     raise KeyStateError("That key is already revoked.")
                 raise KeyNotFound("No such key.")
             await self._log_event(conn, key_id, "revoked", actor_id, {"reason": reason or "no reason given"})
-            dprint(f"revoked {mask_key(row['key'])} by {actor_id}")
+            dprint(f"revoked {row['key_hint']} by {actor_id}")
             return row
 
     async def restore_key(self, key_id: int, *, actor_id: int) -> Record:
@@ -478,7 +553,7 @@ class KeyStore:
                         raise KeyStateError("That key is already active.")
                     raise KeyNotFound("No such key.")
                 await self._log_event(conn, key_id, "restored", actor_id, {})
-                dprint(f"restored {mask_key(row['key'])} by {actor_id}")
+                dprint(f"restored {row['key_hint']} by {actor_id}")
                 return row
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == ONE_ACTIVE_INDEX:
@@ -486,3 +561,310 @@ class KeyStore:
                     "That user already has another active key. Revoke it first."
                 ) from exc
             raise
+
+    # ------------------------------------------------------------------
+    # Lobby background votes
+    # ------------------------------------------------------------------
+    async def set_vote_review_channel(self, guild_id: int, channel_id: int) -> Record:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                insert into public.zeta_vote_config (guild_id, review_channel_id, updated_at)
+                values ($1, $2, now())
+                on conflict (guild_id) do update set
+                    review_channel_id = excluded.review_channel_id,
+                    updated_at = now()
+                returning *
+                """,
+                guild_id, channel_id,
+            )
+
+    async def get_vote_config(self, guild_id: int) -> Optional[Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                "select * from public.zeta_vote_config where guild_id = $1", guild_id
+            )
+
+    async def open_vote(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        actor_id: int,
+        duration: dt.timedelta,
+    ) -> Record:
+        try:
+            async with self._pool.acquire() as conn:
+                return await conn.fetchrow(
+                    """
+                    insert into public.zeta_votes
+                        (guild_id, submission_channel_id, created_by, closes_at)
+                    values ($1, $2, $3, now() + $4::interval)
+                    returning *
+                    """,
+                    guild_id, channel_id, actor_id, duration,
+                )
+        except asyncpg.UniqueViolationError as exc:
+            if exc.constraint_name == "zeta_votes_one_active_per_guild":
+                raise VoteAlreadyActive("A vote is already open or awaiting review in this server.") from exc
+            raise
+
+    async def get_active_vote(self, guild_id: int) -> Optional[Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                select * from public.zeta_votes
+                where guild_id = $1 and status in ('open', 'reviewing')
+                order by id desc limit 1
+                """,
+                guild_id,
+            )
+
+    async def get_open_votes(self) -> list[Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(
+                "select * from public.zeta_votes where status = 'open' order by closes_at"
+            )
+
+    async def reserve_vote_submission(
+        self, *, guild_id: int, submitter_id: int, submission_limit: int
+    ) -> Record:
+        async with self._pool.acquire() as conn, conn.transaction():
+            vote = await conn.fetchrow(
+                """
+                select * from public.zeta_votes
+                where guild_id = $1 and status = 'open' and closes_at > now()
+                for update
+                """,
+                guild_id,
+            )
+            if vote is None:
+                raise VoteUnavailable("There is no open lobby background vote right now.")
+            submitted = await conn.fetchval(
+                """
+                select count(*) from public.zeta_vote_submissions
+                where vote_id = $1 and submitter_id = $2
+                  and review_status in ('posting', 'pending', 'reviewing', 'rejected', 'selected', 'skipped')
+                """,
+                vote["id"], submitter_id,
+            )
+            if int(submitted or 0) >= submission_limit:
+                raise SubmissionLimitReached(
+                    f"You have reached your limit of {submission_limit} submission(s) for this vote."
+                )
+            return await conn.fetchrow(
+                """
+                insert into public.zeta_vote_submissions (vote_id, submitter_id)
+                values ($1, $2)
+                returning *
+                """,
+                vote["id"], submitter_id,
+            )
+
+    async def publish_vote_submission(
+        self,
+        submission_id: int,
+        *,
+        message_id: int,
+        image_url: str,
+        file_name: str,
+    ) -> Record:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                update public.zeta_vote_submissions
+                set message_id = $2, image_url = $3, file_name = $4, review_status = 'pending'
+                where id = $1 and review_status = 'posting'
+                returning *
+                """,
+                submission_id, message_id, image_url, file_name,
+            )
+        if row is None:
+            raise VoteUnavailable("The submission reservation expired. Please try again.")
+        return row
+
+    async def delete_vote_submission_reservation(self, submission_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "delete from public.zeta_vote_submissions where id = $1 and review_status = 'posting'",
+                submission_id,
+            )
+
+    async def get_vote_submissions_for_tally(self, vote_id: int) -> list[Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                select s.*, v.guild_id, v.submission_channel_id
+                from public.zeta_vote_submissions s
+                join public.zeta_votes v on v.id = s.vote_id
+                where s.vote_id = $1 and s.review_status in ('pending', 'posting')
+                order by s.created_at, s.id
+                """,
+                vote_id,
+            )
+
+    async def finish_vote_tally(self, vote_id: int, counts: dict[int, int]) -> None:
+        async with self._pool.acquire() as conn, conn.transaction():
+            vote = await conn.fetchrow(
+                "select * from public.zeta_votes where id = $1 for update", vote_id
+            )
+            if vote is None or vote["status"] != "open":
+                return
+            posting_count = await conn.fetchval(
+                "select count(*) from public.zeta_vote_submissions "
+                "where vote_id = $1 and review_status = 'posting'",
+                vote_id,
+            )
+            if posting_count:
+                raise VoteSubmissionsPending("Submissions are still being posted; retry the vote close.")
+            for submission_id, count in counts.items():
+                await conn.execute(
+                    """
+                    update public.zeta_vote_submissions
+                    set vote_count = $2
+                    where id = $1 and vote_id = $3 and review_status = 'pending'
+                    """,
+                    submission_id, max(0, count), vote_id,
+                )
+            await conn.execute(
+                "update public.zeta_votes set status = 'reviewing', ended_at = now() "
+                "where id = $1 and status = 'open'",
+                vote_id,
+            )
+
+    async def claim_next_vote_review(self, vote_id: int) -> Optional[Record]:
+        async with self._pool.acquire() as conn, conn.transaction():
+            vote = await conn.fetchrow(
+                "select * from public.zeta_votes where id = $1 for update", vote_id
+            )
+            if vote is None or vote["status"] != "reviewing":
+                return None
+            current = await conn.fetchrow(
+                """
+                select s.*, v.guild_id, v.submission_channel_id
+                from public.zeta_vote_submissions s
+                join public.zeta_votes v on v.id = s.vote_id
+                where s.vote_id = $1 and s.review_status = 'reviewing'
+                order by s.id limit 1
+                """,
+                vote_id,
+            )
+            if current is not None:
+                return current
+            next_row = await conn.fetchrow(
+                """
+                select * from public.zeta_vote_submissions
+                where vote_id = $1 and review_status = 'pending'
+                order by vote_count desc, created_at, id
+                limit 1 for update
+                """,
+                vote_id,
+            )
+            if next_row is None:
+                await conn.execute(
+                    "update public.zeta_votes set status = 'exhausted' where id = $1", vote_id
+                )
+                return None
+            await conn.fetchrow(
+                """
+                update public.zeta_vote_submissions
+                set review_status = 'reviewing'
+                where id = $1
+                returning id
+                """,
+                next_row["id"],
+            )
+            return await conn.fetchrow(
+                """
+                select s.*, v.guild_id, v.submission_channel_id, v.status as vote_status
+                from public.zeta_vote_submissions s
+                join public.zeta_votes v on v.id = s.vote_id
+                where s.id = $1
+                """,
+                next_row["id"],
+            )
+
+    async def set_vote_review_message(self, submission_id: int, message_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                update public.zeta_vote_submissions
+                set review_message_id = $2
+                where id = $1 and review_status = 'reviewing'
+                """,
+                submission_id, message_id,
+            )
+
+    async def get_votes_awaiting_review(self) -> list[Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(
+                "select id from public.zeta_votes where status = 'reviewing' order by id"
+            )
+
+    async def resolve_vote_submission(
+        self, submission_id: int, *, approved: bool, actor_id: int
+    ) -> Optional[Record]:
+        async with self._pool.acquire() as conn, conn.transaction():
+            vote_id = await conn.fetchval(
+                "select vote_id from public.zeta_vote_submissions where id = $1",
+                submission_id,
+            )
+            if vote_id is None:
+                return None
+            vote = await conn.fetchrow(
+                "select * from public.zeta_votes where id = $1 for update", vote_id
+            )
+            submission = await conn.fetchrow(
+                "select * from public.zeta_vote_submissions where id = $1 for update",
+                submission_id,
+            )
+            if (
+                vote is None
+                or vote["status"] != "reviewing"
+                or submission is None
+                or submission["review_status"] != "reviewing"
+            ):
+                return None
+            status = "selected" if approved else "rejected"
+            await conn.execute(
+                """
+                update public.zeta_vote_submissions
+                set review_status = $2, reviewed_by = $3, reviewed_at = now()
+                where id = $1
+                """,
+                submission_id, status, actor_id,
+            )
+            if approved:
+                await conn.execute(
+                    """
+                    update public.zeta_vote_submissions set review_status = 'skipped'
+                    where vote_id = $1 and review_status = 'pending'
+                    """,
+                    vote_id,
+                )
+                await conn.execute(
+                    "update public.zeta_votes set status = 'selected' where id = $1", vote_id
+                )
+            return await conn.fetchrow(
+                """
+                select s.*, v.guild_id, v.submission_channel_id, v.status as vote_status
+                from public.zeta_vote_submissions s
+                join public.zeta_votes v on v.id = s.vote_id
+                where s.id = $1
+                """,
+                submission_id,
+            )
+
+    async def get_vote_submission(self, submission_id: int) -> Optional[Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                select s.*, v.guild_id, v.submission_channel_id, v.status as vote_status,
+                       c.review_channel_id
+                from public.zeta_vote_submissions s
+                join public.zeta_votes v on v.id = s.vote_id
+                left join public.zeta_vote_config c on c.guild_id = v.guild_id
+                where s.id = $1
+                """,
+                submission_id,
+            )

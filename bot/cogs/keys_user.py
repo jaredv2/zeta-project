@@ -14,7 +14,6 @@ from discord.ext import commands
 
 from config import dprint
 from db import CooldownActive, KeyStore, NoActiveKey
-from keygen import mask_key
 from ui import (
     COLOR_BAD,
     COLOR_BRAND,
@@ -95,16 +94,22 @@ class KeysUser(commands.Cog):
         row, created = await self.store.get_or_issue(
             owner_id=interaction.user.id, guild_id=interaction.guild_id
         )
-        dprint(f"/get-key -> {mask_key(row['key'])} created={created}")
+        dprint(f"/get-key -> {row['key_hint']} created={created}")
         embed = key_embed(
             row,
-            title="Your new ZETA key 🔑" if created else "Your ZETA key 🔑",
+            title="Your new ZETA key 🔑" if created else "Your active ZETA key",
             color=COLOR_OK if created else COLOR_BRAND,
         )
+        if not created:
+            embed.add_field(
+                name="Key shown once",
+                value="For security, the full key is only shown when issued. If you lost it, use `/regen-key` to create a replacement.",
+                inline=False,
+            )
         embed.set_footer(text=KEY_FOOTER)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="key-info", description="Show your key, its scope and status")
+    @app_commands.command(name="key-info", description="Show your key hint, scope and status")
     @app_commands.guild_only()
     @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
     async def key_info(self, interaction: discord.Interaction) -> None:
@@ -127,7 +132,7 @@ class KeysUser(commands.Cog):
         embed.set_footer(text=KEY_FOOTER)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="key-history", description="List your last 10 keys (older ones are masked)")
+    @app_commands.command(name="key-history", description="List your last 10 keys (hints only)")
     @app_commands.guild_only()
     @app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
     async def key_history(self, interaction: discord.Interaction) -> None:
@@ -143,8 +148,7 @@ class KeysUser(commands.Cog):
 
         lines = []
         for row in rows:
-            shown = row["key"] if row["status"] == "active" else mask_key(row["key"])
-            line = f"{status_label(row['status'])} · `{shown}` · `{row['scope']}` · created {ts(row['created_at'])}"
+            line = f"{status_label(row['status'])} · `{row['key_hint']}` · `{row['scope']}` · created {ts(row['created_at'])}"
             if row["status"] == "revoked":
                 line += f" · revoked {ts(row['revoked_at'])}"
             lines.append(line)

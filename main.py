@@ -1,14 +1,12 @@
-"""Key-gated file proxy: Supabase Storage behind ZETA keys stored in Supabase Postgres.
+"""Key-gated file proxy: Supabase Storage behind HMAC-verified ZETA keys.
 
     GET /files/{path}         key in header  X-Zeta-Key: ZETA-...   (or Authorization: Bearer ZETA-...)
-    GET /k/{key}/{path}       key in the URL (for loaders that can't set headers, e.g. Unity/WebGL;
-                              relative asset URLs keep working because they inherit the /k/{key}/ prefix)
 
-Flow: validate key format -> look the key up (cached briefly) -> check status is 'active'
--> check the key's scope may read that path -> stream the object from Storage.
+Credentials are accepted in headers or the validation request body, never URLs.
+The database stores keyed HMAC verifiers, not raw keys.
 
 Run:  uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log
-      (--no-access-log matters: the /k/{key}/ form would otherwise put full keys in logs)
+      (--no-access-log prevents credentials from reaching access logs)
 """
 from __future__ import annotations
 
@@ -17,7 +15,8 @@ import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import NoReturn, Optional
 from urllib.parse import quote
 
 import httpx
@@ -29,7 +28,7 @@ from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
 from cosmetics import cosmetics_for_scope, scope_allows
 from db import KeyStore
-from keygen import is_valid_key, mask_key, normalize_key
+from keygen import is_valid_key, key_verifier, mask_key, normalize_key
 
 log = logging.getLogger("zeta.proxy")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -46,6 +45,7 @@ class Config:
     bucket: str
     db_ssl_mode: str
     cache_ttl: float
+    key_pepper: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -62,6 +62,7 @@ class Config:
             bucket=need("SUPABASE_BUCKET"),
             db_ssl_mode=os.getenv("DB_SSL_MODE", "require"),
             cache_ttl=float(os.getenv("AUTH_CACHE_TTL", "30")),
+            key_pepper=need("ZETA_KEY_PEPPER"),
         )
 
 
@@ -95,6 +96,30 @@ class AuthCache:
         self._data[key] = (time.monotonic() + ttl, scope)
 
 
+class ValidationRateLimiter:
+    def __init__(self, limit: int = 20, window_seconds: int = 600) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._attempts: dict[str, tuple[float, int]] = {}
+
+    def check(self, client_id: str) -> Optional[int]:
+        now = time.monotonic()
+        window_start, count = self._attempts.get(client_id, (now, 0))
+        if now - window_start >= self.window_seconds:
+            window_start, count = now, 0
+        if count >= self.limit:
+            return max(1, int(self.window_seconds - (now - window_start)))
+        self._attempts[client_id] = (window_start, count + 1)
+        if len(self._attempts) > 10_000:
+            self._attempts = {
+                client: state for client, state in self._attempts.items()
+                if now - state[0] < self.window_seconds
+            }
+            if len(self._attempts) > 10_000:
+                self._attempts.pop(next(iter(self._attempts)))
+        return None
+
+
 # --------------------------------------------------------------------------
 # App lifecycle
 # --------------------------------------------------------------------------
@@ -102,8 +127,13 @@ class AuthCache:
 async def lifespan(app: FastAPI):
     cfg = Config.from_env()
     app.state.cfg = cfg
-    app.state.store = await KeyStore.connect(cfg.database_url, ssl_mode=cfg.db_ssl_mode, max_size=5)
+    app.state.store = await KeyStore.connect(
+        cfg.database_url, ssl_mode=cfg.db_ssl_mode, max_size=5, key_pepper=cfg.key_pepper
+    )
+    await app.state.store.ensure_schema(Path(__file__).resolve().parent / "bot" / "schema.sql")
     app.state.auth_cache = AuthCache(cfg.cache_ttl)
+    app.state.validation_rate_limiter = ValidationRateLimiter()
+    app.state.auth_failure_rate_limiter = ValidationRateLimiter()
     app.state.http = httpx.AsyncClient(
         base_url=f"{cfg.supabase_url}/storage/v1/object/{cfg.bucket}/",
         headers={"apikey": cfg.service_key, "Authorization": f"Bearer {cfg.service_key}"},
@@ -141,23 +171,36 @@ def unauthorized() -> HTTPException:
     return HTTPException(401, "Invalid or missing key.", headers={"WWW-Authenticate": "Bearer"})
 
 
+def reject_auth_attempt(request: Request) -> NoReturn:
+    client_id = request.client.host if request.client else "unknown"
+    retry_after = request.app.state.auth_failure_rate_limiter.check(client_id)
+    if retry_after is not None:
+        raise HTTPException(
+            429,
+            "Too many failed authentication attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    raise unauthorized()
+
+
 async def authenticate(request: Request, raw_key: Optional[str]) -> str:
     """Return the key's scope, or raise 401."""
     if not raw_key:
-        raise unauthorized()
+        reject_auth_attempt(request)
     key = normalize_key(raw_key)
     if not is_valid_key(key):
-        raise unauthorized()
+        reject_auth_attempt(request)
 
+    verifier = key_verifier(key, request.app.state.cfg.key_pepper)
     cache: AuthCache = request.app.state.auth_cache
-    hit, scope = cache.get(key)
+    hit, scope = cache.get(verifier)
     if not hit:
         row = await request.app.state.store.get_key(key)
         scope = row["scope"] if row is not None and row["status"] == "active" else None
-        cache.put(key, scope)
+        cache.put(verifier, scope)
         log.info("auth %s -> %s", mask_key(key), scope or "denied")
     if scope is None:
-        raise unauthorized()
+        reject_auth_attempt(request)
     return scope
 
 
@@ -235,6 +278,14 @@ async def serve(request: Request, raw_key: Optional[str], raw_path: str) -> Resp
 # --------------------------------------------------------------------------
 @app.post("/validate")
 async def validate_key(body: KeyValidationRequest, request: Request) -> dict[str, object]:
+    client_id = request.client.host if request.client else "unknown"
+    retry_after = request.app.state.validation_rate_limiter.check(client_id)
+    if retry_after is not None:
+        raise HTTPException(
+            429,
+            "Too many key validation attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
     scope = await authenticate(request, body.key)
     return {"valid": True, "scope": scope, "cosmetics": cosmetics_for_scope(scope)}
 
@@ -248,11 +299,6 @@ async def get_cosmetics(request: Request) -> dict[str, object]:
 @app.api_route("/files/{path:path}", methods=["GET", "HEAD"])
 async def files_with_header_key(path: str, request: Request) -> Response:
     return await serve(request, header_key(request), path)
-
-
-@app.api_route("/k/{key}/{path:path}", methods=["GET", "HEAD"])
-async def files_with_path_key(key: str, path: str, request: Request) -> Response:
-    return await serve(request, key, path)
 
 
 @app.api_route(

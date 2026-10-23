@@ -28,8 +28,8 @@ Create or confirm these external resources:
 - A private Supabase Storage bucket. Upload the release objects to its root
   before testing cosmetic downloads.
 
-The API and bot both use the same `DATABASE_URL`. They need the Zeta tables
-available; the bot's `AUTO_MIGRATE=true` creates/updates its schema on startup.
+The API and bot both use the same `DATABASE_URL`. Both ensure the Zeta schema
+on startup; the schema migration is serialized through a PostgreSQL advisory lock.
 
 ## 2. Deploy as a Docker web service
 
@@ -50,6 +50,7 @@ available; the bot's `AUTO_MIGRATE=true` creates/updates its schema on startup.
 |---|---|
 | `DATABASE_URL` | Supabase Postgres connection string; use the pooler if appropriate |
 | `DISCORD_TOKEN` | Newly rotated bot token; secret |
+| `ZETA_KEY_PEPPER` | One shared, persistent random secret (at least 32 bytes); secret |
 | `SUPABASE_URL` | `https://<project-ref>.supabase.co` |
 | `SUPABASE_SERVICE_KEY` | Supabase service-role key; secret |
 | `SUPABASE_BUCKET` | Name of the private bucket containing the staged assets |
@@ -70,6 +71,26 @@ available; the bot's `AUTO_MIGRATE=true` creates/updates its schema on startup.
 | `AUTH_CACHE_TTL` | `30` | API key authorization cache in seconds |
 | `CORS_ORIGINS` | `*` | Current API default; tighten to known origins if needed |
 | `LOG_LEVEL` | `INFO` | Service log verbosity |
+
+Generate `ZETA_KEY_PEPPER` once with `python -c "import secrets; print(secrets.token_hex(32))"`.
+Set the exact same value for the API and bot, and keep it stable: changing it invalidates
+every issued key. The API/bot startup schema migration converts existing plaintext keys to
+HMAC verifiers and drops the plaintext database column; keep `AUTO_MIGRATE=true` for the bot.
+Existing keys remain valid, but can no longer be recovered
+from the database or shown in full by `/get-key`; users who lost a key must use `/regen-key`.
+Legacy keys keep working for compatibility but have less entropy than newly issued keys;
+encourage members to rotate them with `/regen-key`.
+
+New keys are shown in full only at issuance. The API accepts keys in headers or the
+`/validate` request body; key-in-URL asset routes have been removed. Validation attempts
+are limited per client IP in the running API process (20 per 10 minutes); failed authentication
+requests on other authenticated routes are limited too. These in-memory limits reset on restart
+and are per instance, so retain a single API instance or add an upstream shared rate limit if
+scaling out. Rate limits deter guessing but cannot stop someone from sharing a valid bearer key;
+revoke or rotate a shared key and issue separate, least-privilege keys.
+The userscript must retain the raw key in userscript-manager storage to authenticate;
+this storage is not a secret vault. Hashing in the browser would only turn the hash
+into another replayable bearer credential, so the HMAC is computed server-side only.
 
 Render provides the HTTP port. The supervisor starts Uvicorn on `0.0.0.0:$PORT`
 and starts the bot from `bot/`. The API uses `--no-access-log` so key-bearing

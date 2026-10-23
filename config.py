@@ -105,6 +105,7 @@ def redact_dsn(dsn: str) -> str:
 class Settings:
     token: str
     database_url: str
+    key_pepper: str
     db_ssl: str
     db_pool_max: int
     dev_guild_id: Optional[int]
@@ -130,6 +131,10 @@ def load_settings() -> Settings:
     elif not database_url.startswith(("postgres://", "postgresql://")):
         problems.append("DATABASE_URL must start with postgresql:// (copy it from Supabase > Connect)")
 
+    key_pepper = os.getenv("ZETA_KEY_PEPPER", "").strip()
+    if len(key_pepper.encode("utf-8")) < 32:
+        problems.append("ZETA_KEY_PEPPER must contain at least 32 random bytes")
+
     db_ssl = os.getenv("DB_SSL", "require").strip().lower() or "require"
     if db_ssl not in _SSL_MODES:
         problems.append(f"DB_SSL must be one of {sorted(_SSL_MODES)} (got {db_ssl!r})")
@@ -147,6 +152,7 @@ def load_settings() -> Settings:
     settings = Settings(
         token=token,
         database_url=database_url,
+        key_pepper=key_pepper,
         db_ssl=db_ssl,
         db_pool_max=db_pool_max,
         dev_guild_id=_env_int("DEV_GUILD_ID", problems),

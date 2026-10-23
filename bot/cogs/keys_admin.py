@@ -19,7 +19,7 @@ from discord.ext import commands
 from checks import admin_only
 from config import dprint
 from db import ActiveKeyExists, KeyNotFound, KeyStateError, KeyStore, StoreError
-from keygen import DEFAULT_SCOPE, SCOPES, is_valid_key, mask_key, normalize_key
+from keygen import DEFAULT_SCOPE, SCOPES
 from ui import (
     COLOR_BAD,
     COLOR_BRAND,
@@ -73,41 +73,21 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
     async def _resolve(
         self,
         interaction: discord.Interaction,
-        user: Optional[discord.User],
-        key: Optional[str],
+        user: discord.User,
         *,
         active_only: bool = False,
     ) -> Optional[asyncpg.Record]:
-        """Find the key a staff member means (by user XOR by key text).
-        Sends the error message itself and returns None when it can't."""
-        if (user is None) == (key is None):
-            await interaction.followup.send(
-                embed=simple_embed("Pick one", "Give me either a **user** or a **key** (exactly one of them).", COLOR_WARN),
-                ephemeral=True,
-            )
-            return None
-
-        if key is not None:
-            normalized = normalize_key(key)
-            if not is_valid_key(normalized):
-                await interaction.followup.send(
-                    embed=simple_embed("Invalid key", "Keys look like `ZETA-XXXX-XXXX-XXXX-ATEZ`.", COLOR_WARN),
-                    ephemeral=True,
-                )
-                return None
-            row = await self.store.get_key(normalized)
-        else:
-            assert user is not None
-            row = await (
-                self.store.get_active_key(user.id) if active_only else self.store.get_latest_key(user.id)
-            )
+        """Find a member's key without asking staff to paste the secret into Discord."""
+        row = await (
+            self.store.get_active_key(user.id) if active_only else self.store.get_latest_key(user.id)
+        )
 
         if row is None:
             await interaction.followup.send(
                 embed=simple_embed("Not found", "No matching key.", COLOR_WARN), ephemeral=True
             )
             return None
-        dprint(f"resolved target -> {mask_key(row['key'])} (owner {row['owner_id']})")
+        dprint(f"resolved target -> {row['key_hint']} (owner {row['owner_id']})")
         return row
 
     async def _notify_owner(self, row: asyncpg.Record, embed: discord.Embed) -> str:
@@ -159,7 +139,7 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
             )
         except ActiveKeyExists as exc:
             existing = exc.existing
-            hint = f"\nTheir key: `{mask_key(existing['key'])}` (`{existing['scope']}`)." if existing else ""
+            hint = f"\nTheir key: `{existing['key_hint']}` (`{existing['scope']}`)." if existing else ""
             await interaction.followup.send(
                 embed=simple_embed(
                     "Already has a key",
@@ -180,15 +160,13 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
     # ------------------------------------------------------------------
     # /keyadmin lookup
     # ------------------------------------------------------------------
-    @app_commands.command(name="lookup", description="Show a key and its history (by user or by key)")
-    @app_commands.describe(user="Look up this user's key", key="Or paste the key itself")
+    @app_commands.command(name="lookup", description="Show a member's key hint and history")
+    @app_commands.describe(user="Look up this user's key")
     @admin_only()
-    async def lookup(
-        self, interaction: discord.Interaction, user: Optional[discord.User] = None, key: Optional[str] = None
-    ) -> None:
+    async def lookup(self, interaction: discord.Interaction, user: discord.User) -> None:
         dprint(f"/keyadmin lookup by {interaction.user.id}")
         await interaction.response.defer(ephemeral=True)
-        row = await self._resolve(interaction, user, key)
+        row = await self._resolve(interaction, user)
         if row is None:
             return
         events = await self.store.events_for_key(row["id"], limit=6)
@@ -203,7 +181,6 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
     @app_commands.describe(
         scope="New scope",
         user="Change this user's key",
-        key="Or paste the key itself",
         notify="DM the member about the change",
     )
     @app_commands.choices(scope=SCOPE_CHOICES)
@@ -212,13 +189,12 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
         self,
         interaction: discord.Interaction,
         scope: app_commands.Choice[str],
-        user: Optional[discord.User] = None,
-        key: Optional[str] = None,
+        user: discord.User,
         notify: bool = True,
     ) -> None:
         dprint(f"/keyadmin scope by {interaction.user.id} -> {scope.value}")
         await interaction.response.defer(ephemeral=True)
-        row = await self._resolve(interaction, user, key)
+        row = await self._resolve(interaction, user)
         if row is None:
             return
         try:
@@ -249,7 +225,6 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
     @app_commands.command(name="revoke", description="Revoke a key so it stops working")
     @app_commands.describe(
         user="Revoke this user's active key",
-        key="Or paste the key itself",
         reason="Why (saved in the audit trail)",
         notify="DM the member",
     )
@@ -257,14 +232,13 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
     async def revoke(
         self,
         interaction: discord.Interaction,
-        user: Optional[discord.User] = None,
-        key: Optional[str] = None,
+        user: discord.User,
         reason: Optional[str] = None,
         notify: bool = True,
     ) -> None:
         dprint(f"/keyadmin revoke by {interaction.user.id}")
         await interaction.response.defer(ephemeral=True)
-        row = await self._resolve(interaction, user, key, active_only=True)
+        row = await self._resolve(interaction, user, active_only=True)
         if row is None:
             return
         try:
@@ -280,7 +254,7 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
         if notify:
             dm = simple_embed(
                 "Your key was revoked",
-                f"Your ZETA key `{mask_key(revoked['key'])}` was revoked."
+                f"Your ZETA key `{revoked['key_hint']}` was revoked."
                 + (f"\nReason: {revoked['revoke_reason']}" if revoked["revoke_reason"] else ""),
                 COLOR_BAD,
             )
@@ -291,14 +265,12 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
     # /keyadmin restore
     # ------------------------------------------------------------------
     @app_commands.command(name="restore", description="Re-activate a revoked key")
-    @app_commands.describe(user="Restore this user's latest key", key="Or paste the key itself")
+    @app_commands.describe(user="Restore this user's latest key")
     @admin_only()
-    async def restore(
-        self, interaction: discord.Interaction, user: Optional[discord.User] = None, key: Optional[str] = None
-    ) -> None:
+    async def restore(self, interaction: discord.Interaction, user: discord.User) -> None:
         dprint(f"/keyadmin restore by {interaction.user.id}")
         await interaction.response.defer(ephemeral=True)
-        row = await self._resolve(interaction, user, key)
+        row = await self._resolve(interaction, user)
         if row is None:
             return
         try:
@@ -341,7 +313,7 @@ class KeysAdmin(commands.GroupCog, group_name="keyadmin", group_description="Man
             total_pages = max(1, math.ceil(total / PAGE_SIZE))
             if rows:
                 lines = [
-                    f"{'🟢' if r['status'] == 'active' else '🔴'} `{r['key']}` · <@{r['owner_id']}> · "
+                    f"{'🟢' if r['status'] == 'active' else '🔴'} `{r['key_hint']}` · <@{r['owner_id']}> · "
                     f"`{r['scope']}` · {ts(r['created_at'])}"
                     for r in rows
                 ]

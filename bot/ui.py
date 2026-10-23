@@ -10,7 +10,6 @@ import asyncpg
 import discord
 
 from config import dprint
-from keygen import mask_key
 
 log = logging.getLogger("zeta.ui")
 
@@ -47,15 +46,15 @@ def simple_embed(title: str, description: str, color: int = COLOR_BRAND) -> disc
 
 
 def key_embed(
-    row: asyncpg.Record,
+    row: asyncpg.Record | dict[str, Any],
     *,
     title: str,
     color: int = COLOR_BRAND,
     reveal: bool = True,
     show_owner: bool = False,
 ) -> discord.Embed:
-    """Standard key card. reveal=False masks the middle of the key."""
-    shown = row["key"] if reveal else mask_key(row["key"])
+    """Show a newly issued key once; stored rows only contain a masked hint."""
+    shown = row["key"] if reveal and isinstance(row, dict) and "key" in row else row["key_hint"]
     embed = discord.Embed(title=title[:256], description=f"```\n{shown}\n```", color=color)
     embed.add_field(name="Scope", value=f"`{row['scope']}`", inline=True)
     embed.add_field(name="Status", value=status_label(row["status"]), inline=True)
