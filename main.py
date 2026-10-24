@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import mimetypes
 import os
 import time
 from contextlib import asynccontextmanager
@@ -75,16 +74,6 @@ HEALTH_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 GITHUB_API = "https://api.github.com"
 GITHUB_CDN_HOST_SUFFIX = ".githubusercontent.com"
 RELEASE_ASSET_CACHE_SECONDS = 300
-CRAZYGAMES_CDN = "https://files.crazygames.com"
-CRAZYGAMES_REFERER = "https://www.crazygames.com/"
-GAME_ASSET_PREFIX = "buildnow-gg/225/"
-GAME_COSMETIC_BUNDLE = (
-    "buildnow-gg/225/Build/StreamingAssets/aa/WebGL/"
-    "6e813a3edd180fe07ca4e438849b67b5.bundle"
-)
-GAME_COSMETIC_DATA_HASH = "cdbbb83c0ef9757d51e8dedb4979dcc3"
-
-
 def github_asset_name(path: str) -> str:
     """Map an API object path to a unique, flat GitHub release asset filename."""
     return "zeta-" + path.replace("/", "--")
@@ -198,64 +187,6 @@ class GitHubReleaseAssets:
             raise HTTPException(502, "Asset host unavailable.") from exc
 
 
-class GameAssetProxy:
-    def __init__(self, local_roots: list[Path], client: httpx.AsyncClient) -> None:
-        self.local_roots = [root.resolve() for root in local_roots]
-        self.client = client
-
-    def local_file(self, path: str) -> Optional[Path]:
-        filename = path.rsplit("/", 1)[-1]
-        if (
-            path.lower() == GAME_COSMETIC_BUNDLE.lower()
-            or filename.lower().startswith(GAME_COSMETIC_DATA_HASH + ".data")
-        ):
-            return None
-        relative = Path(*path.split("/"))
-        for root in self.local_roots:
-            candidate = (root / relative).resolve()
-            try:
-                if os.path.commonpath((str(root), str(candidate))) != str(root):
-                    continue
-            except ValueError:
-                continue
-            if candidate.is_file():
-                return candidate
-        return None
-
-    async def open(
-        self, path: str, request: Request
-    ) -> tuple[Optional[httpx.Response], Optional[Path]]:
-        local = self.local_file(path)
-        if local is not None:
-            return None, local
-
-        url = CRAZYGAMES_CDN + "/" + quote(path, safe="/")
-        if request.url.query:
-            url += "?" + request.url.query
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Referer": CRAZYGAMES_REFERER,
-            "Accept": request.headers.get("accept", "*/*"),
-            "Accept-Encoding": "identity",
-        }
-        for name in ("range", "if-none-match", "if-modified-since"):
-            if name in request.headers:
-                headers[name] = request.headers[name]
-        try:
-            upstream = await self.client.send(
-                self.client.build_request(request.method, url, headers=headers),
-                stream=True,
-            )
-        except httpx.HTTPError as exc:
-            log.warning("CrazyGames asset request failed for %s: %r", path, exc)
-            raise HTTPException(502, "Game asset host unavailable.") from exc
-        return upstream, None
-
-
 # --------------------------------------------------------------------------
 # Auth cache: one DB hit per key per TTL instead of one per asset request.
 # Trade-off: a revoked key keeps working for up to AUTH_CACHE_TTL seconds.
@@ -336,11 +267,6 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         follow_redirects=False,
     )
-    app.state.game_cdn = httpx.AsyncClient(
-        timeout=httpx.Timeout(180.0, connect=10.0),
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        follow_redirects=True,
-    )
     app.state.assets = GitHubReleaseAssets(
         owner=cfg.github_owner,
         repo=cfg.github_repo,
@@ -349,13 +275,6 @@ async def lifespan(app: FastAPI):
         cdn_client=app.state.github_cdn,
     )
     content_root = Path(__file__).resolve().parent / "bng_content"
-    configured_root = os.getenv("BNG_PROXY_LOCAL_ROOT", "").strip()
-    local_roots = (
-        [Path(configured_root), content_root / "local", content_root]
-        if configured_root
-        else [content_root / "local", content_root]
-    )
-    app.state.game_assets = GameAssetProxy(local_roots, app.state.game_cdn)
     cosmetic_root = os.getenv("BNG_COSMETIC_LOCAL_ROOT", "").strip()
     app.state.cosmetic_local_root = (
         Path(cosmetic_root).resolve()
@@ -365,7 +284,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await app.state.game_cdn.aclose()
         await app.state.github_cdn.aclose()
         await app.state.github_api.aclose()
         await app.state.store.close()
@@ -541,51 +459,6 @@ async def get_cosmetics(request: Request) -> dict[str, object]:
 @app.api_route("/files/{path:path}", methods=["GET", "HEAD"])
 async def files_with_header_key(path: str, request: Request) -> Response:
     return await serve(request, header_key(request), path)
-
-
-@app.api_route("/game/{path:path}", methods=["GET", "HEAD"])
-async def game_assets_with_header_key(path: str, request: Request) -> Response:
-    await authenticate(request, header_key(request))
-    clean = clean_path(path)
-    if not clean.startswith(GAME_ASSET_PREFIX):
-        raise HTTPException(404, "Not found.")
-
-    assets: GameAssetProxy = request.app.state.game_assets
-    upstream, local = await assets.open(clean, request)
-    if local is not None:
-        content_type = mimetypes.guess_type(local.name)[0] or "application/octet-stream"
-        headers = {"Cache-Control": "no-store, no-cache, must-revalidate"}
-        log.info("game asset local %s (%s bytes)", clean, local.stat().st_size)
-        if request.method == "HEAD":
-            headers["Content-Length"] = str(local.stat().st_size)
-            return Response(status_code=200, media_type=content_type, headers=headers)
-        return FileResponse(local, media_type=content_type, headers=headers)
-
-    if upstream is None:
-        raise HTTPException(502, "Game asset host returned no response.")
-    status = upstream.status_code
-    log.info("game asset CDN %s -> HTTP %s", clean, status)
-    allowed_headers = (
-        "content-type", "content-length", "content-range", "accept-ranges",
-        "etag", "last-modified", "content-encoding",
-    )
-    headers = {name: upstream.headers[name] for name in allowed_headers if name in upstream.headers}
-    headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-    if status not in (200, 206, 304, 416):
-        await upstream.aclose()
-        if status == 404:
-            raise HTTPException(404, "Not found.")
-        log.warning("CrazyGames asset host returned HTTP %s for %s", status, clean)
-        raise HTTPException(502, "Game asset host error.")
-    if request.method == "HEAD" or status in (304, 416):
-        await upstream.aclose()
-        return Response(status_code=status, headers=headers)
-    return StreamingResponse(
-        upstream.aiter_raw(),
-        status_code=status,
-        headers=headers,
-        background=BackgroundTask(upstream.aclose),
-    )
 
 
 @app.api_route(

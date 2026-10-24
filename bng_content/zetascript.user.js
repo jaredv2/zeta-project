@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Zeta Project Cosmetic Tool (BNG)
 // @namespace    zeta-project
-// @version      1.8
+// @version      1.9
 // @author       Zeta Project (numbers, juju)
 // @description  Zeta cosmetic loader for BuildNow GG. Press F8 to choose a build-wood look and reload to apply.
 // @downloadURL  https://rtdsvvwowdahdzpnlvtq.supabase.co/v1/object/public/cdn/zetascript.user.js
@@ -25,6 +25,9 @@
   const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
 
   const DEFAULT_API_BASE = 'https://zeta-project.onrender.com';
+  const SUPABASE_ADDRESSABLES_BASE =
+    'https://rtdsvvwowdahdzpnlvtq.supabase.co/v1/object/public/cdn/buildnow-gg/225/Build/StreamingAssets/aa/';
+  const ADDRESSABLES_CACHE_BUST = 'zeta-addressables-v1.9';
 
   function normalizeApiBase(v) {
     if (typeof v !== 'string') return null;
@@ -218,12 +221,9 @@
   let reportsSent = 0;
 
   const WORLD_BUNDLE_HASH = '6e813a3edd180fe07ca4e438849b67b5';
-  const UNITY_RUNTIME_MARKER = '__zeta_runtime_v1_8__';
   const ADDRESSABLES_RUNTIME_TOKEN = '{UnityEngine.AddressableAssets.Addressables.RuntimePath}';
   let bundlePromise = null;
   let bundleBlobUrl = null;
-  let settingsBlobUrl = null;
-  let catalogBlobUrl = null;
   let addressablesCatalog = null;
   const addressablesBlobByPath = new Map();
   let addressablesPromise = null;
@@ -252,34 +252,6 @@
   function say(msg) {
     try { (W.alert || alert).call(W, msg); } catch (e) {}
   }
-
-  try {
-    if (typeof GM_registerMenuCommand === 'function') {
-      GM_registerMenuCommand('Set Zeta API URL', function () {
-        const v = ui('Zeta API base URL (Render HTTPS URL)\n\nCurrently using: ' + API_BASE, API_BASE);
-        if (v === null) return;                       // cancelled
-        if (!v.trim()) {
-          try { GM_setValue('apiBase', ''); } catch (e) {}
-          say('Cleared. Reload to use ' + DEFAULT_API_BASE);
-          return;
-        }
-        const n = normalizeApiBase(v);
-        if (!n) { say('Use an HTTPS URL (HTTP is allowed only for localhost).'); return; }
-        try { GM_setValue('apiBase', n); } catch (e) {}
-        say('Saved: ' + n + '\nReload the game page to use it.');
-      });
-      GM_registerMenuCommand('Show Zeta API URL', function () {
-        say('Zeta API:\n' + API_BASE);
-      });
-      GM_registerMenuCommand('Toggle FNCS Champion locker item', function () {
-        injectTiles = !injectTiles;
-        try { GM_setValue('injectTiles', injectTiles); } catch (e) {}
-        say('FNCS Champion locker item: ' +
-            (injectTiles ? 'ON' : 'OFF') + '\nReload the game page to apply.');
-      });
-    }
-  } catch (e) {}
-
   // Surface anything the game itself logs or throws.
   try {
     ['error', 'warn'].forEach(function (k) {
@@ -509,62 +481,15 @@
     }
   }
 
-  function isZetaRuntimeUrl(u) {
-    if (typeof u !== 'string' || u.indexOf('blob:') === 0) return false;
-    try {
-      const parsed = new W.URL(u, location.href);
-      return /(^|\.)files\.crazygames\.com$/i.test(parsed.hostname) &&
-        parsed.pathname.indexOf('/StreamingAssets/' + UNITY_RUNTIME_MARKER + '/aa/') >= 0;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function rewriteZetaRuntimeUrl(u) {
-    if (!isZetaRuntimeUrl(u)) return u;
-    try {
-      const parsed = new W.URL(u, location.href);
-      parsed.pathname = parsed.pathname.replace(
-        '/StreamingAssets/' + UNITY_RUNTIME_MARKER + '/aa/',
-        '/StreamingAssets/aa/'
-      );
-      return parsed.href;
-    } catch (e) {
-      return u;
-    }
-  }
-
   function cacheControlForUnityUrl(u, originalCacheControl, context) {
     try {
       if (typeof u === 'string' &&
           (u.indexOf('blob:') === 0 || isOurData(u) || isOurBundle(u))) {
         return 'no-store';
       }
-      if (isZetaRuntimeUrl(u)) {
-        return 'no-store';
-      }
+      if (addressablesMetadataFor(u)) return 'no-store';
     } catch (e) {}
     return originalCacheControl.call(context, u);
-  }
-
-  function addressablesBaseUrl() {
-    const config = W.config && W.config.unityConfig;
-    const root = config && config.streamingAssetsUrl;
-    if (typeof root !== 'string' || !root) {
-      throw new Error('Unity streaming root is unavailable.');
-    }
-    const parsed = new W.URL(root, location.href);
-    if (!/(^|\.)files\.crazygames\.com$/i.test(parsed.hostname)) {
-      throw new Error('Unexpected Unity streaming host.');
-    }
-    parsed.pathname = parsed.pathname.replace(
-      new RegExp('/' + UNITY_RUNTIME_MARKER + '/?$'),
-      ''
-    );
-    if (!/\/buildnow-gg\/\d+\/Build\/StreamingAssets$/.test(parsed.pathname)) {
-      throw new Error('Unexpected Unity StreamingAssets path.');
-    }
-    return API_BASE + '/game' + parsed.pathname.replace(/\/$/, '') + '/aa/';
   }
 
   function addressablesBundlePath(id) {
@@ -575,19 +500,10 @@
 
   function ensureAddressablesMetadata() {
     if (addressablesPromise) return addressablesPromise;
-    let base;
-    try {
-      base = addressablesBaseUrl();
-    } catch (error) {
-      log('Addressables settings/catalog prefetch skipped:', error.message);
-      return Promise.reject(error);
-    }
-
-    const cacheBust = '?zeta=' + encodeURIComponent(UNITY_RUNTIME_MARKER);
-    const headers = { 'X-Zeta-Key': apiKey };
+    const cacheBust = '?zeta=' + encodeURIComponent(ADDRESSABLES_CACHE_BUST);
     addressablesPromise = Promise.all([
-      gmGet(base + 'settings.json' + cacheBust, 30000, headers),
-      gmGet(base + 'catalog.json' + cacheBust, 30000, headers)
+      gmGet(SUPABASE_ADDRESSABLES_BASE + 'settings.json' + cacheBust, 30000),
+      gmGet(SUPABASE_ADDRESSABLES_BASE + 'catalog.json' + cacheBust, 30000)
     ]).then(function (responses) {
       const Decoder = W.TextDecoder || TextDecoder;
       const settings = JSON.parse(new Decoder('utf-8').decode(new Uint8Array(responses[0].response)));
@@ -597,10 +513,14 @@
         throw new Error('Unexpected Addressables settings/catalog response.');
       }
       addressablesCatalog = catalog;
-      settingsBlobUrl = makeBlobUrl(responses[0].response, 'application/json;charset=utf-8');
-      catalogBlobUrl = makeBlobUrl(responses[1].response, 'application/json;charset=utf-8');
-      addressablesBlobByPath.set('settings.json', settingsBlobUrl);
-      addressablesBlobByPath.set('catalog.json', catalogBlobUrl);
+      addressablesBlobByPath.set(
+        'settings.json',
+        makeBlobUrl(responses[0].response, 'application/json;charset=utf-8')
+      );
+      addressablesBlobByPath.set(
+        'catalog.json',
+        makeBlobUrl(responses[1].response, 'application/json;charset=utf-8')
+      );
       stats.prefetch.settings = responses[0].response.byteLength;
       stats.prefetch.catalog = responses[1].response.byteLength;
       log('prefetched settings.json', stats.prefetch.settings);
@@ -613,7 +533,7 @@
       return true;
     }).catch(function (error) {
       addressablesPromise = null;
-      log('Addressables settings/catalog prefetch failed; using API proxy fallback:', error.message);
+      log('Supabase settings/catalog prefetch failed; game will use its original CDN metadata:', error.message);
       report('addressables-metadata-failed', { m: String(error.message).slice(0, 120) });
       throw error;
     });
@@ -624,67 +544,29 @@
     if (addressablesAssetsPromise) return addressablesAssetsPromise;
     addressablesAssetsPromise = ensureAddressablesMetadata().then(function (ready) {
       if (!ready || !addressablesCatalog) return false;
-      const base = addressablesBaseUrl();
-      const cacheBust = '?zeta=' + encodeURIComponent(UNITY_RUNTIME_MARKER);
-      const headers = { 'X-Zeta-Key': apiKey };
       const paths = addressablesCatalog.m_InternalIds
         .map(addressablesBundlePath)
         .filter(Boolean);
       const targetPath = '/WebGL/' + PICKAXE_BUNDLE_HASH + '.bundle';
-      return Promise.all(paths.map(function (relative) {
-        const key = relative.replace(/^\/+/, '');
-        if (relative.toLowerCase() === targetPath.toLowerCase() && bundleBlobUrl) {
-          addressablesBlobByPath.set(key, bundleBlobUrl);
-          stats.prefetch.bundles++;
-          log('prefetched', relative, stats.bundleBytes, '(scope-authorized Zeta bundle)');
-          return Promise.resolve();
-        }
-        return gmGet(base + relative.replace(/^\/+/, '') + cacheBust, 180000, headers).then(function (response) {
-          const blobUrl = makeBlobUrl(response.response, 'application/octet-stream');
-          addressablesBlobByPath.set(key, blobUrl);
-          stats.prefetch.bundles++;
-          if (stats.urls.length < 20) stats.urls.push('/aa' + relative + ' (' + response.response.byteLength + ')');
-          log('prefetched', relative, response.response.byteLength);
-        }).catch(function (error) {
-          stats.prefetch.errors.push(relative + ': ' + error.message);
-          log('PREFETCH FAILED', relative, error.message);
-        });
-      })).then(function () {
-        return true;
+      const hasTarget = paths.some(function (path) {
+        return path.toLowerCase() === targetPath.toLowerCase();
       });
+      if (bundleBlobUrl && hasTarget) {
+        addressablesBlobByPath.set(targetPath.slice(1), bundleBlobUrl);
+        stats.prefetch.bundles = 1;
+        log('registered scoped bundle replacement', targetPath, stats.bundleBytes);
+      } else if (bundleBlobUrl) {
+        log('catalog does not reference the scoped bundle hash; leaving catalog bundles unchanged.');
+      } else {
+        log('no authorized pickaxe bundle; catalog bundles will load from CrazyGames.');
+      }
+      return true;
     }).catch(function (error) {
       addressablesAssetsPromise = null;
-      log('Addressables bundle prefetch failed:', error.message);
+      log('Addressables replacement setup failed:', error.message);
       return false;
     });
     return addressablesAssetsPromise;
-  }
-
-  function patchStreamingAssetsRoot(config) {
-    if (!config || typeof config !== 'object') return false;
-    let changed = false;
-    function patchUnityConfig(unityConfig) {
-      const root = unityConfig && unityConfig.streamingAssetsUrl;
-      if (typeof root !== 'string' || !root) return;
-      try {
-        const parsed = new W.URL(root, location.href);
-        if (!/(^|\.)files\.crazygames\.com$/i.test(parsed.hostname) ||
-            !/\/buildnow-gg\/\d+\/Build\/StreamingAssets\/?$/.test(parsed.pathname)) return;
-        const path = parsed.pathname.replace(/\/+$/, '');
-        if (path.endsWith('/' + UNITY_RUNTIME_MARKER)) return;
-        parsed.pathname = path + '/' + UNITY_RUNTIME_MARKER;
-        unityConfig.streamingAssetsUrl = parsed.href.replace(/\/$/, '');
-        changed = true;
-      } catch (e) {}
-    }
-    patchUnityConfig(config.unityConfig);
-    const loaderConfig = config.loaderOptions && config.loaderOptions.unityConfigOptions;
-    patchUnityConfig(loaderConfig);
-    if (changed) {
-      stats.runtimeCacheBust = UNITY_RUNTIME_MARKER;
-      log('Unity StreamingAssets cache namespace ->', UNITY_RUNTIME_MARKER);
-    }
-    return changed;
   }
 
   function dataFor(u) {
@@ -714,8 +596,7 @@
     try {
       const parsed = new W.URL(u, location.href);
       if (!/(^|\.)files\.crazygames\.com$/i.test(parsed.hostname)) return null;
-      const marker = '/StreamingAssets/' + UNITY_RUNTIME_MARKER + '/aa/';
-      if (parsed.pathname.indexOf(marker) < 0) return null;
+      if (parsed.pathname.indexOf('/StreamingAssets/aa/') < 0) return null;
       const index = parsed.pathname.lastIndexOf('/aa/');
       if (index < 0) return null;
       return parsed.pathname.slice(index + 4).replace(/^\/+/, '');
@@ -795,7 +676,6 @@
   function patchConfig(v) {
     try {
       if (v && typeof v === 'object') {
-        patchStreamingAssetsRoot(v);
         stats.configHooked = true;
       }
     } catch (e) {}
@@ -825,16 +705,10 @@
     report('lg-call');
     log('loadGame intercepted, waiting for authorized assets');
     prefetchPromise.then(function () {
-      patchStreamingAssetsRoot(W.config);
       return ensureAddressablesBundles();
     }).then(function () {
       log('authorized asset preparation finished', stats.prefetch);
       report('pf-done');
-      patchStreamingAssetsRoot(W.config);
-      if (!stats.runtimeCacheBust) {
-        log('Unity StreamingAssets root was not versioned; cached Addressables assets may bypass the swaps.');
-        report('runtime-cache-bust-missing');
-      }
       swapConfigDataUrl();
       let r;
       try { r = _loadGame.apply(W, args); } catch (e) {
@@ -1586,12 +1460,6 @@
             stats.bundleMisses = (stats.bundleMisses || 0) + 1;
             if (stats.bundleMisses <= 4) log('custom pickaxe bundle was not ready; passing through:', url);
           }
-          const rewritten = rewriteZetaRuntimeUrl(url);
-          if (rewritten !== url) {
-            stats.runtimeRewrites = (stats.runtimeRewrites || 0) + 1;
-            if (stats.runtimeRewrites <= 8) log('xhr runtime cache-bust -> CDN', url, '->', rewritten);
-            url = rewritten;
-          }
         }
       } catch (e) {}
       return _open.apply(this, [method, url].concat([].slice.call(arguments, 2)));
@@ -1617,12 +1485,6 @@
               stats.bundleMisses = (stats.bundleMisses || 0) + 1;
               if (stats.bundleMisses <= 4) log('custom pickaxe bundle was not ready; passing through:', input);
             }
-            const rewritten = rewriteZetaRuntimeUrl(input);
-            if (rewritten !== input) {
-              stats.runtimeRewrites = (stats.runtimeRewrites || 0) + 1;
-              if (stats.runtimeRewrites <= 8) log('fetch runtime cache-bust -> CDN', input, '->', rewritten);
-              input = rewritten;
-            }
           }
         } else if (input && input.url) {
           const b = blobFor(input.url);
@@ -1636,12 +1498,6 @@
             if (isOurBundle(input.url)) {
               stats.bundleMisses = (stats.bundleMisses || 0) + 1;
               if (stats.bundleMisses <= 4) log('custom pickaxe bundle was not ready; passing through:', input.url);
-            }
-            const rewritten = rewriteZetaRuntimeUrl(input.url);
-            if (rewritten !== input.url) {
-              stats.runtimeRewrites = (stats.runtimeRewrites || 0) + 1;
-              if (stats.runtimeRewrites <= 8) log('fetch runtime cache-bust -> CDN', input.url, '->', rewritten);
-              input = new (W.Request || Request)(rewritten, input);
             }
           }
         }
