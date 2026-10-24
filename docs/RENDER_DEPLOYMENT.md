@@ -25,8 +25,9 @@ Create or confirm these external resources:
   permission to assign its verification role.
 - A Supabase Postgres database. Prefer the session pooler connection string for
   a long-running service, and URL-encode special characters in its password.
-- A private Supabase Storage bucket. Upload the release objects to its root
-  before testing cosmetic downloads.
+- A private GitHub repository for cosmetic release assets. The API needs a
+  fine-grained token with read-only Contents access; keep upload permission in
+  a separate local token.
 
 The API and bot both use the same `DATABASE_URL`. Both ensure the Zeta schema
 on startup; the schema migration is serialized through a PostgreSQL advisory lock.
@@ -51,9 +52,10 @@ on startup; the schema migration is serialized through a PostgreSQL advisory loc
 | `DATABASE_URL` | Supabase Postgres connection string; use the pooler if appropriate |
 | `DISCORD_TOKEN` | Newly rotated bot token; secret |
 | `ZETA_KEY_PEPPER` | One shared, persistent random secret (at least 32 bytes); secret |
-| `SUPABASE_URL` | `https://<project-ref>.supabase.co` |
-| `SUPABASE_SERVICE_KEY` | Supabase service-role key; secret |
-| `SUPABASE_BUCKET` | Name of the private bucket containing the staged assets |
+| `GITHUB_ASSET_OWNER` | GitHub owner of the private assets repository |
+| `GITHUB_ASSET_REPO` | Private repository name containing the release assets |
+| `GITHUB_ASSET_TAG` | Release tag used for cosmetic assets (for example `zeta-assets-v1`) |
+| `GITHUB_ASSET_READ_TOKEN` | Fine-grained token with read-only Contents access to that repository; secret |
 
 ### Recommended configuration
 
@@ -104,7 +106,7 @@ Wait for Render's deploy and health check to pass, then verify:
 2. Render logs show the API listening and the Discord bot becoming ready.
 3. The bot is online in Discord, and `/verify-setup` can post its panel.
 4. A test key can validate and read its entitlement list through the API.
-5. The API serves an authorized private-bucket object and rejects a path
+5. The API serves an authorized private GitHub release asset and rejects a path
    outside that key's scope.
 
 The health endpoint pings Postgres. A healthy HTTP process is not enough if
@@ -112,7 +114,7 @@ the bot failed to connect, so verify both service logs and bot status.
 
 The userscript is configured to use `https://zeta-project.onrender.com` by
 default. Its **Set Zeta API URL** menu item can override this for local testing
-or if the deployment URL changes. Never put `SUPABASE_SERVICE_KEY` or
+or if the deployment URL changes. Never put `GITHUB_ASSET_READ_TOKEN` or
 `DISCORD_TOKEN` in the userscript.
 
 ## Local Docker Compose
@@ -144,6 +146,6 @@ build context and ignored by Git; do not print or share their contents.
   permissions, and the bot's startup logs.
 - **Slash commands do not appear immediately:** global command sync can take
   time. Set `DEV_GUILD_ID` temporarily while developing.
-- **Cosmetic downloads fail:** verify the bucket name, private object paths,
-  service-role key, uploaded package, and key scope. Keep the bucket private;
+- **Cosmetic downloads fail:** verify the private repository, release tag,
+  API read token, uploaded assets, and key scope. Keep the repository private;
   downloads must go through the authenticated API.

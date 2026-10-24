@@ -14,16 +14,17 @@ token in the Developer Portal before deployment; never commit local env files.
 
 ## Cosmetic release
 
-The current private-bucket package is staged under
+The current private GitHub release package is staged under
 [`bng_content/release/`](./bng_content/release/). It contains two scope-specific
 pickaxe bundles and two background-mode data files for each of five wood looks.
 See
 [`bng_content/docs/LOCAL_SERVING.md`](./bng_content/docs/LOCAL_SERVING.md) for
-staging, Supabase upload, Render configuration, and userscript setup.
+staging, private GitHub release upload, Render configuration, and userscript
+setup.
 
 The package has not been uploaded or deployed. The Render API URL is still
-unknown; set it in the userscript menu after deployment. Keep the Supabase
-bucket private and keep the service-role key out of the userscript.
+unknown; set it in the userscript menu after deployment. Keep the GitHub
+repository private and both GitHub tokens out of the userscript.
 
 ## Documentation
 
