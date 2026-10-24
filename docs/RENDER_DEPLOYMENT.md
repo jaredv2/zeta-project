@@ -72,6 +72,8 @@ on startup; the schema migration is serialized through a PostgreSQL advisory loc
 | `DEV_GUILD_ID` | empty or a test guild ID | Set temporarily for faster command sync |
 | `AUTH_CACHE_TTL` | `30` | API key authorization cache in seconds |
 | `CORS_ORIGINS` | `*` | Current API default; tighten to known origins if needed |
+| `BNG_PROXY_LOCAL_ROOT` | unset | Optional BuildNow overlay root; path must contain `buildnow-gg/225/...` |
+| `BNG_COSMETIC_LOCAL_ROOT` | unset | Optional staged scope-specific assets root; path must contain `cosmetics/...` |
 | `LOG_LEVEL` | `INFO` | Service log verbosity |
 
 Generate `ZETA_KEY_PEPPER` once with `python -c "import secrets; print(secrets.token_hex(32))"`.
@@ -106,8 +108,21 @@ Wait for Render's deploy and health check to pass, then verify:
 2. Render logs show the API listening and the Discord bot becoming ready.
 3. The bot is online in Discord, and `/verify-setup` can post its panel.
 4. A test key can validate and read its entitlement list through the API.
-5. The API serves an authorized private GitHub release asset and rejects a path
-   outside that key's scope.
+5. The API serves `/game/buildnow-gg/225/Build/StreamingAssets/aa/settings.json`
+   from the local overlay or BuildNow CDN.
+6. The API serves an authorized private GitHub release asset and rejects a path
+   outside that key's cosmetic scope.
+
+The Docker image excludes `bng_content/` because it contains large local source
+assets. Compose mounts the local BuildNow snapshot and staged release assets
+read-only for local testing. In production, mount or copy only the desired
+files and set `BNG_PROXY_LOCAL_ROOT` to the directory containing
+`buildnow-gg/225/...` and `BNG_COSMETIC_LOCAL_ROOT` to the directory containing
+`cosmetics/...`. `/game/` uses the local snapshot when present and otherwise
+streams from the fixed BuildNow GG CDN. `/files/` checks scope before serving a
+matching staged cosmetic; if it is absent, it falls back to the private GitHub
+release. Unity receives the authorized cosmetic replacement at the original
+catalog bundle path through the userscript.
 
 The health endpoint pings Postgres. A healthy HTTP process is not enough if
 the bot failed to connect, so verify both service logs and bot status.

@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env.docker
+    volumes:
+      - ./bng_content/buildnow-gg:/opt/bng-game-assets/buildnow-gg:ro
+      - ./bng_content/release/assets:/opt/zeta-cosmetic-assets:ro
     environment:
       PORT: ${PORT:-8000}
       PYTHONPATH: /app

@@ -9,4 +9,8 @@ bot/.env.*
 __pycache__/
 **/__pycache__/
 *.py[cod]
-bng_content/
+bng_content/*
+!bng_content/zetascript.user.js
+!bng_content/docs/
+bng_content/docs/*
+!bng_content/docs/LOCAL_SERVING.md
