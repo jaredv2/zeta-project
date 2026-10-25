@@ -307,6 +307,40 @@ class KeyStore:
                 key_verifier(normalize_key(key), self._key_pepper),
             )
 
+    async def claim_key_client(self, key: str, client_id: str) -> Optional[Record]:
+        """Claim or refresh a key's five-minute idle lease for one installation."""
+        key_hash = key_verifier(normalize_key(key), self._key_pepper)
+        client_hash = key_verifier("zeta-client:" + client_id, self._key_pepper)
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                with active_key as materialized (
+                    select id, scope
+                    from public.zeta_keys
+                    where key_hash = $1 and status = 'active'
+                ),
+                claimed as (
+                    insert into public.zeta_key_sessions
+                        (key_id, client_hash, last_seen_at)
+                    select id, $2, now()
+                    from active_key
+                    on conflict (key_id) do update set
+                        client_hash = excluded.client_hash,
+                        last_seen_at = now()
+                    where public.zeta_key_sessions.client_hash = excluded.client_hash
+                       or public.zeta_key_sessions.last_seen_at
+                            < now() - interval '5 minutes'
+                    returning key_id
+                )
+                select active_key.id, active_key.scope,
+                       (claimed.key_id is not null) as client_claimed
+                from active_key
+                left join claimed on claimed.key_id = active_key.id
+                """,
+                key_hash,
+                client_hash,
+            )
+
     async def get_active_key(self, owner_id: int) -> Optional[Record]:
         async with self._pool.acquire() as conn:
             return await conn.fetchrow(

@@ -13,10 +13,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from checks import NotAuthorized
 from config import Settings, dprint, load_settings
 from db import KeyStore
+from dotenv import load_dotenv
 
+load_dotenv(override=True)
 log = logging.getLogger("zeta")
 
 BASE_DIR = Path(__file__).resolve().parent

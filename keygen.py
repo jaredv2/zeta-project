@@ -24,7 +24,7 @@ GROUP_LEN = 4
 # No 0/O and 1/I so a key read aloud or typed from a screenshot is not ambiguous.
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-SCOPES = ("all", "default", "builds", "sweat", 'vip')
+SCOPES = ("all", "default", "builds", "sweat", "vip", "pickaxes")
 DEFAULT_SCOPE = "default"
 
 # Built from the constants above so the format can never drift from the generator.

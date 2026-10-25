@@ -31,12 +31,30 @@ create table if not exists public.zeta_keys (
     revoked_at    timestamptz,
     revoked_by    bigint,
     revoke_reason text,
-    constraint zeta_keys_scope_check      check (scope in ('all', 'default', 'builds', 'sweat', 'vip')),
+    constraint zeta_keys_scope_check      check (scope in ('all', 'default', 'builds', 'sweat', 'vip', 'pickaxes')),
     constraint zeta_keys_status_check     check (status in ('active', 'revoked'))
 );
 
 alter table public.zeta_keys add column if not exists key_hash text;
 alter table public.zeta_keys add column if not exists key_hint text;
+
+-- Add the pickaxe-only entitlement scope to databases created by older versions.
+do $$
+begin
+    if not exists (
+        select 1
+        from pg_constraint
+        where conrelid = 'public.zeta_keys'::regclass
+          and conname = 'zeta_keys_scope_check'
+          and pg_get_constraintdef(oid) like '%pickaxes%'
+    ) then
+        alter table public.zeta_keys drop constraint if exists zeta_keys_scope_check;
+        alter table public.zeta_keys
+            add constraint zeta_keys_scope_check
+            check (scope in ('all', 'default', 'builds', 'sweat', 'vip', 'pickaxes'));
+    end if;
+end
+$$;
 
 -- A user can only ever hold ONE active key. The database enforces it,
 -- so two simultaneous /get-key clicks cannot create two keys.
@@ -47,6 +65,14 @@ create unique index if not exists zeta_keys_one_active_per_owner
 create index if not exists zeta_keys_owner_idx        on public.zeta_keys (owner_id, created_at desc);
 create index if not exists zeta_keys_scope_status_idx on public.zeta_keys (scope, status);
 create index if not exists zeta_keys_created_idx      on public.zeta_keys (created_at desc);
+
+-- A single userscript installation may hold a key lease at a time. The lease
+-- can be taken over after five minutes without an authenticated request.
+create table if not exists public.zeta_key_sessions (
+    key_id        bigint      primary key references public.zeta_keys (id) on delete cascade,
+    client_hash   text        not null,
+    last_seen_at  timestamptz not null default now()
+);
 
 -- Audit trail: who did what to which key -------------------------------
 create table if not exists public.zeta_key_events (
@@ -115,6 +141,7 @@ create index if not exists zeta_vote_submissions_owner_idx
 -- connects as the database owner role, which bypasses RLS.
 alter table public.zeta_guild_config enable row level security;
 alter table public.zeta_keys         enable row level security;
+alter table public.zeta_key_sessions enable row level security;
 alter table public.zeta_key_events   enable row level security;
 alter table public.zeta_vote_config enable row level security;
 alter table public.zeta_votes enable row level security;

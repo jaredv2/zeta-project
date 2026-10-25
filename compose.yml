@@ -6,10 +6,13 @@ services:
     env_file:
       - .env.docker
     volumes:
-      - ./bng_content/release/assets:/opt/zeta-cosmetic-assets:ro
+      - ./out/prebaked-release/assets:/opt/zeta-cosmetic-assets:ro
+      - ./out/prebaked-release/game:/opt/zeta-game-assets:ro
     environment:
       PORT: ${PORT:-8000}
       PYTHONPATH: /app
+      BNG_COSMETIC_LOCAL_ROOT: /opt/zeta-cosmetic-assets
+      BNG_PROXY_LOCAL_ROOT: /opt/zeta-game-assets
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     init: true

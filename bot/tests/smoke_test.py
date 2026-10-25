@@ -395,7 +395,7 @@ async def test_definitions(settings: Settings) -> ZetaBot:
     create_payload = next(p for p in payloads if p["name"] == "keyadmin")
     create_opts = next(o for o in create_payload["options"] if o["name"] == "create")["options"]
     scope_opt = next(o for o in create_opts if o["name"] == "scope")
-    check("scope option offers exactly the 4 scopes",
+    check("scope option offers every supported scope",
           sorted(c["value"] for c in scope_opt["choices"]) == sorted(SCOPES))
     check("keyadmin hidden from non-staff by default",
           int(create_payload.get("default_member_permissions") or 0) == discord.Permissions(manage_guild=True).value)

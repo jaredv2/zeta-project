@@ -1,37 +1,35 @@
 # Zeta Project
 
-Project root Python files (`main.py`, `db.py`, `keygen.py`, `checks.py`,
-`cosmetics.py`, and `config.py`) implement the key and file API. `bot/` contains
-the bot. BuildNow GG assets, the userscript, Unity tools, and release utilities
-are in `bng_content/`.
+The root [proxy.py](./proxy.py) provides the key-authenticated asset service
+and the localhost BuildNow overlay. Shared key storage and authorization live
+in `db.py`, `keygen.py`, and `cosmetics.py`; `bot/` contains the Discord bot.
+Prebake, userscript, Unity, and release tools are maintained in the project
+root and `tools/`.
 
 ## Run the API and bot together
 
-The root [Dockerfile](./Dockerfile) and [compose.yml](./compose.yml) run the API
-and Discord bot in one container. For local startup and Render deployment, see
-[docs/RENDER_DEPLOYMENT.md](./docs/RENDER_DEPLOYMENT.md). Rotate the Discord bot
-token in the Developer Portal before deployment; never commit local env files.
+The root [Dockerfile](./Dockerfile) and [compose.yml](./compose.yml) run the
+asset service and Discord bot in one container. For local startup and Render
+deployment, see [docs/RENDER_DEPLOYMENT.md](./docs/RENDER_DEPLOYMENT.md).
+Rotate the Discord bot token in the Developer Portal before deployment; never
+commit local env files.
 
 ## Cosmetic release
 
-The current private GitHub release package is staged under
-[`bng_content/release/`](./bng_content/release/). It contains two scope-specific
-pickaxe bundles and two background-mode data files for each of five wood looks.
-See
-[`bng_content/docs/LOCAL_SERVING.md`](./bng_content/docs/LOCAL_SERVING.md) for
-staging, private GitHub release upload, Render configuration, and userscript
-setup.
-
-The package has not been uploaded or deployed. The Render API URL is still
-unknown; set it in the userscript menu after deployment. Keep the GitHub
-repository private and both GitHub tokens out of the userscript.
+The prebaked package is staged in `out/prebaked-release/` and published to the
+private `jaredv2/zeta-cdn` release tagged `zeta-assets-v2`. It includes the
+catalog and settings JSON, the custom bundles, and the seven wood variants.
+Keep the repository private and both GitHub tokens out of the userscript.
 
 ## Documentation
 
-- [`bng_content/docs/CONTENT_MAP.md`](./bng_content/docs/CONTENT_MAP.md)
-- [`bng_content/docs/PICKAXE_CONTENT_PIPELINE.md`](./bng_content/docs/PICKAXE_CONTENT_PIPELINE.md)
-- [`bng_content/docs/WOOD_CONTENT_PIPELINE.md`](./bng_content/docs/WOOD_CONTENT_PIPELINE.md)
-- [`bng_content/docs/REMOVE_STAR_WAND_II_GUIDE.md`](./bng_content/docs/REMOVE_STAR_WAND_II_GUIDE.md)
+- [Render deployment](./docs/RENDER_DEPLOYMENT.md)
+- [Release uploader](./tools/upload_release_assets.py)
 
-Generated and experimental content remains under `bng_content/out/`; source
-assets and reference bundles are retained.
+## Local Python tools
+
+Build, inspection, and one-off Python scripts are in `tools/`. Run them from
+the repository root (for example, `python tools/prebake_assets.py`) so their
+project-relative asset paths resolve correctly. Run `python proxy.py` for the
+local CDN overlay; the deployed key-gated ASGI service is `proxy:app`. Logs are
+written to `logs/`; loose scratch artifacts are kept under `archive/scratch/`.

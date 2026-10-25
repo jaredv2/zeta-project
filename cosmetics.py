@@ -1,4 +1,4 @@
-"""Scope-based cosmetic entitlements and Storage path authorization."""
+"""Scope-based entitlement checks for cosmetic assets and game config files."""
 from __future__ import annotations
 
 from typing import Optional
@@ -8,30 +8,49 @@ SCOPE_PREFIXES: dict[str, Optional[tuple[str, ...]]] = {
     "all": None,
     "default": ("default/",),
     "builds": ("default/", "builds/"),
+    "pickaxes": (),
     "sweat": ("default/", "sweat/"),
     "vip": ("default/", "builds/", "sweat/", "vip/"),
 }
 
 WOOD_LOOKS = (
-    "rainbow", "natural", "charcoal", "whitewash", "gold",
+    "rainbow", "natural", "charcoal", "whitewash", "gold", "checker", "blue",
 )
-PICKAXES = ("star-wand", "fncs-champion")
+PICKAXE_BUNDLES = (
+    "6e813a3edd180fe07ca4e438849b67b5.bundle",
+    "2aa55d46c4def6847148e4e9af03de6d.bundle",
+)
+GAME_CONFIG_FILES = frozenset({
+    "game/buildnow-gg/225/Build/StreamingAssets/aa/catalog.json",
+    "game/buildnow-gg/225/Build/StreamingAssets/aa/settings.json",
+})
+PICKAXES = (
+    "star-wand",
+    "fncs-champion",
+    "candy-axe",
+    "minecraft-sword",
+    "leviathan-axe",
+)
 SCOPE_COSMETICS: dict[str, dict[str, tuple[str, ...]]] = {
     "default": {
         "pickaxes": ("star-wand",),
-        "wood": ("rainbow",),
+        "wood": ("rainbow", "natural"),
     },
     "builds": {
         "pickaxes": (),
         "wood": WOOD_LOOKS,
+    },
+    "pickaxes": {
+        "pickaxes": PICKAXES,
+        "wood": (),
     },
     "sweat": {
         "pickaxes": ("star-wand",),
         "wood": ("rainbow", "natural", "charcoal", "whitewash"),
     },
     "vip": {
-        "pickaxes": ("star-wand", "fncs-champion"),
-        "wood": WOOD_LOOKS,
+        "pickaxes": PICKAXES,
+        "wood": ("rainbow", "natural", "gold", "charcoal"),
     },
     "all": {
         "pickaxes": PICKAXES,
@@ -41,14 +60,17 @@ SCOPE_COSMETICS: dict[str, dict[str, tuple[str, ...]]] = {
 
 
 def scope_allows(scope: str, path: str) -> bool:
-    """Check legacy folder access or an explicitly granted cosmetic path.
+    """Check legacy folder access or an explicitly granted asset path.
 
     Cosmetic paths use `cosmetics/pickaxes/{id}/...` or
-    `cosmetics/wood/{look}/...`. Matching is by complete path component so a
+    `cosmetics/wood/{look}/...`; game config access is limited to the exact
+    catalog and settings paths. Matching is by complete path component so a
     similarly prefixed ungranted ID cannot inherit access.
     """
     if scope not in SCOPE_PREFIXES:
         return False
+    if path in GAME_CONFIG_FILES:
+        return True
     parts = path.split("/")
     if parts[0] == "cosmetics":
         grants = SCOPE_COSMETICS.get(scope)
@@ -58,7 +80,7 @@ def scope_allows(scope: str, path: str) -> bool:
         if category == "pickaxes":
             return len(parts) == 4 and (
                 cosmetic in grants["pickaxes"]
-                and parts[3] == "6e813a3edd180fe07ca4e438849b67b5.bundle"
+                and parts[3] in PICKAXE_BUNDLES
             )
         if category == "wood":
             if cosmetic not in grants["wood"]:

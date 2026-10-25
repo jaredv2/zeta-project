@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 # Read .env (if present) into os.environ. Real environment variables win,
 # so hosting dashboards (Railway, Render, ...) override the file.
-load_dotenv()
+load_dotenv(override=True)
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n"}

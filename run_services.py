@@ -9,7 +9,9 @@ import sys
 import time
 from pathlib import Path
 from types import FrameType
+from dotenv import load_dotenv
 
+load_dotenv(override=True)
 
 ROOT = Path(__file__).resolve().parent
 STOP_REQUESTED = False
@@ -62,9 +64,9 @@ def main() -> int:
 
     services: list[tuple[str, list[str], Path]] = [
         (
-            "api",
+            "proxy",
             [
-                sys.executable, "-m", "uvicorn", "main:app",
+                sys.executable, "-m", "uvicorn", "proxy:app",
                 "--host", "0.0.0.0", "--port", str(port), "--no-access-log",
             ],
             ROOT,
