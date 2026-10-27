@@ -23,7 +23,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
-from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 
 from cosmetics import cosmetics_for_scope, scope_allows
 from db import KeyStore
@@ -386,7 +392,7 @@ class GitHubReleaseAssets:
                 raise HTTPException(404, 'Not found.')
             return asset_id
 
-    async def open(self, path, request_headers, method='GET'):
+    async def download_url(self, path, request_headers):
         asset_id = await self._asset_id(path)
         asset_path = f'/repos/{self.owner}/{self.repo}/releases/assets/{asset_id}'
         headers = {'Accept': 'application/octet-stream', **request_headers}
@@ -395,42 +401,52 @@ class GitHubReleaseAssets:
                 self.api_client.build_request('GET', asset_path, headers=headers),
                 stream=True,
             )
-            if response.status_code != 302:
-                return response
-
-            location = response.headers.get('location')
-            await response.aclose()
-            if not location:
-                raise HTTPException(
-                    502, 'Asset host returned an invalid download redirect.'
-                )
-            parsed = urlsplit(location)
-            try:
-                safe_port = parsed.port in (None, 443)
-            except ValueError:
-                safe_port = False
-            if (
-                parsed.scheme != 'https'
-                or not parsed.hostname
-                or not parsed.hostname.endswith(GITHUB_CDN_SUFFIX)
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.fragment
-                or not safe_port
-            ):
-                API_LOG.error('GitHub returned an unexpected asset redirect host.')
-                raise HTTPException(
-                    502, 'Asset host returned an invalid download redirect.'
-                )
-            return await self.cdn_client.send(
-                self.cdn_client.build_request(
-                    method, location, headers=request_headers
-                ),
-                stream=True,
-            )
         except httpx.HTTPError as exc:
             API_LOG.warning('GitHub asset request failed for %s: %r', path, exc)
             raise HTTPException(502, 'Asset host unavailable.') from exc
+
+        if response.status_code != 302:
+            status = response.status_code
+            await response.aclose()
+            if status == 404:
+                raise HTTPException(404, 'Not found.')
+            API_LOG.error('GitHub asset host returned %s for %s', status, path)
+            raise HTTPException(502, 'Asset host error.')
+
+        location = response.headers.get('location')
+        await response.aclose()
+        if not location:
+            raise HTTPException(
+                502, 'Asset host returned an invalid download redirect.'
+            )
+        parsed = urlsplit(location)
+        try:
+            safe_port = parsed.port in (None, 443)
+        except ValueError:
+            safe_port = False
+        if (
+            parsed.scheme != 'https'
+            or not parsed.hostname
+            or not parsed.hostname.endswith(GITHUB_CDN_SUFFIX)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not safe_port
+        ):
+            API_LOG.error('GitHub returned an unexpected asset redirect host.')
+            raise HTTPException(
+                502, 'Asset host returned an invalid download redirect.'
+            )
+        return location
+
+    async def open(self, path, request_headers, method='GET'):
+        location = await self.download_url(path, request_headers)
+        return await self.cdn_client.send(
+            self.cdn_client.build_request(
+                method, location, headers=request_headers
+            ),
+            stream=True,
+        )
 
 
 class RateLimiter:
@@ -677,6 +693,28 @@ async def serve_asset(request, raw_key, raw_path):
         for header in _FORWARD_REQUEST_HEADERS
         if header in request.headers
     }
+    if (
+        request.method == 'GET'
+        and request.headers.get('x-zeta-download-mode') == 'redirect-v1'
+        and hasattr(assets, 'download_url')
+    ):
+        try:
+            download_url = await assets.download_url(path, forward_headers)
+        except httpx.HTTPError as exc:
+            API_LOG.warning('asset host unreachable for %s: %r', path, exc)
+            raise HTTPException(502, 'Asset host unavailable.') from exc
+        response = JSONResponse(
+            {'download_url': download_url},
+            headers={
+                'Cache-Control': 'private, no-store',
+                'X-Zeta-Asset-Redirect': '1',
+            },
+        )
+        response.headers['Content-Type'] = (
+            'application/vnd.zeta.asset-redirect+json'
+        )
+        return response
+
     try:
         upstream = await assets.open(path, forward_headers, request.method)
     except httpx.HTTPError as exc:
